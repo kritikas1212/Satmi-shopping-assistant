@@ -1,0 +1,53 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: satmi-cancel-worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: satmi-chatbot
+      app.kubernetes.io/component: cancel-worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: satmi-chatbot
+        app.kubernetes.io/component: cancel-worker
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+        - name: satmi-cancel-worker
+          image: ghcr.io/your-org/satmi-chatbot:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/sh
+            - -c
+            - PYTHONPATH=src python scripts/process_cancellation_queue.py --sleep 1
+          envFrom:
+            - configMapRef:
+                name: satmi-app-config
+            - secretRef:
+                name: satmi-app-secrets
+          resources:
+            requests:
+              cpu: 150m
+              memory: 192Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}

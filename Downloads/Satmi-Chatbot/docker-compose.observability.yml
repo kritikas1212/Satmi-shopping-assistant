@@ -1,0 +1,60 @@
+version: "3.9"
+
+services:
+  satmi-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: satmi-app
+    ports:
+      - "8000:8000"
+    environment:
+      APP_ENV: dev
+      DATABASE_URL: sqlite:///./satmi_agent.db
+      AUTH_REQUIRED: "false"
+      OBSERVABILITY_ENABLED: "true"
+      METRICS_ENDPOINT_ENABLED: "true"
+      TRACING_ENABLED: "true"
+      TRACING_EXPORTER: otlp
+      TRACING_OTLP_ENDPOINT: http://otel-collector:4318/v1/traces
+    depends_on:
+      - otel-collector
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: satmi-prometheus
+    ports:
+      - "9090:9090"
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+    depends_on:
+      - satmi-app
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: satmi-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/satmi-overview-dashboard.json:/var/lib/grafana/dashboards/satmi-overview-dashboard.json:ro
+    depends_on:
+      - prometheus
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.112.0
+    container_name: satmi-otel-collector
+    command:
+      - "--config=/etc/otelcol-contrib/config.yaml"
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+    volumes:
+      - ./monitoring/otel-collector-config.yml:/etc/otelcol-contrib/config.yaml:ro
