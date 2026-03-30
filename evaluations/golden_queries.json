@@ -1,0 +1,35 @@
+[
+  {
+    "id": "track-order",
+    "message": "Track my order",
+    "expected_status": "active",
+    "expected_intent": "support",
+    "must_include": ["latest order"]
+  },
+  {
+    "id": "cancel-order",
+    "message": "Please cancel order #1001",
+    "expected_status": "active",
+    "expected_intent": "support",
+    "must_include": ["cancelled"]
+  },
+  {
+    "id": "shopping-reco",
+    "message": "Recommend running shoes",
+    "expected_status": "active",
+    "expected_intent": "shopping",
+    "must_include": ["I found"]
+  },
+  {
+    "id": "out-of-scope",
+    "message": "I need legal advice for a dispute",
+    "expected_status": "awaiting_human",
+    "must_include": ["handoff reference"]
+  },
+  {
+    "id": "human-request",
+    "message": "I need a human representative",
+    "expected_status": "awaiting_human",
+    "must_include": ["handoff reference"]
+  }
+]

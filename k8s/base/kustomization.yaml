@@ -1,0 +1,20 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: satmi
+
+resources:
+  - namespace.yaml
+  - configmap.yaml
+  - redis-deployment.yaml
+  - redis-service.yaml
+  - deployment.yaml
+  - worker-deployment.yaml
+  - service.yaml
+  - ingress.yaml
+  - hpa.yaml
+  - pdb.yaml
+
+commonLabels:
+  app.kubernetes.io/name: satmi-chatbot
+  app.kubernetes.io/part-of: satmi-support-platform

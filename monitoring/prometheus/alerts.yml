@@ -1,0 +1,56 @@
+groups:
+  - name: satmi-chatbot-alerts
+    rules:
+      - alert: SatmiHighErrorRate
+        expr: |
+          (
+            sum(rate(satmi_http_requests_total{status_code=~"5.."}[5m]))
+            /
+            sum(rate(satmi_http_requests_total[5m]))
+          ) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "SATMI API high 5xx error rate"
+          description: "5xx responses exceed 5% over last 5 minutes."
+
+      - alert: SatmiRateLimitSpike
+        expr: sum(rate(satmi_rate_limit_hits_total[5m])) > 0.2
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "SATMI chat rate-limit spike"
+          description: "Rate limit rejections are sustained for 10 minutes."
+
+      - alert: SatmiHandoffSpike
+        expr: sum(rate(satmi_handoffs_created_total[10m])) > 0.1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "SATMI handoff volume spike"
+          description: "Escalations to human support increased above baseline."
+
+      - alert: SatmiShopifyErrorSpike
+        expr: sum(rate(satmi_shopify_errors_total[5m])) > 0.2
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "SATMI Shopify integration errors"
+          description: "Shopify API errors are elevated for 5 minutes."
+
+      - alert: SatmiP95LatencyHigh
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum(rate(satmi_http_request_duration_seconds_bucket{path!="/metrics"}[5m])) by (le)
+          ) > 1.5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "SATMI API p95 latency high"
+          description: "P95 request latency is above 1.5s for 10 minutes."

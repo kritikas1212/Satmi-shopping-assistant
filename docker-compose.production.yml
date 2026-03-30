@@ -1,0 +1,77 @@
+version: "3.9"
+
+services:
+  satmi-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: satmi-app-prod
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env.production
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.00"
+          memory: 1G
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: satmi-prometheus-prod
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+    ports:
+      - "9090:9090"
+    restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: satmi-grafana-prod
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env.production
+    environment:
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/satmi-overview-dashboard.json:/var/lib/grafana/dashboards/satmi-overview-dashboard.json:ro
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.112.0
+    container_name: satmi-otel-collector-prod
+    command:
+      - "--config=/etc/otelcol-contrib/config.yaml"
+    ports:
+      - "4318:4318"
+    volumes:
+      - ./monitoring/otel-collector-config.yml:/etc/otelcol-contrib/config.yaml:ro
+    restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
