@@ -4,7 +4,9 @@ import re
 import threading
 import time
 from collections import defaultdict
+from functools import lru_cache
 from typing import Any
+import logging
 
 from fastapi import Header, HTTPException, Request
 
@@ -83,9 +85,94 @@ class InMemoryRateLimiter:
 
 
 rate_limiter = InMemoryRateLimiter()
+logger = logging.getLogger("satmi_agent.security")
+_firebase_init_error: str | None = None
 
 
 def enforce_chat_rate_limit(request: Request, user_id: str) -> None:
     client_host = request.client.host if request.client else "unknown"
     identity = f"{user_id}:{client_host}"
     rate_limiter.check(identity)
+
+
+@lru_cache(maxsize=1)
+def _init_firebase() -> bool:
+    global _firebase_init_error
+    if not settings.firebase_auth_enabled:
+        _firebase_init_error = None
+        return False
+
+    try:
+        import firebase_admin
+        from firebase_admin import credentials
+    except Exception as exc:
+        _firebase_init_error = f"firebase_admin import failed: {exc}"
+        return False
+
+    if firebase_admin._apps:
+        _firebase_init_error = None
+        return True
+
+    try:
+        if settings.firebase_credentials_path:
+            cred = credentials.Certificate(settings.firebase_credentials_path)
+            firebase_admin.initialize_app(cred, {"projectId": settings.firebase_project_id} if settings.firebase_project_id else None)
+        else:
+            firebase_admin.initialize_app(options={"projectId": settings.firebase_project_id} if settings.firebase_project_id else None)
+        _firebase_init_error = None
+        return True
+    except Exception as exc:
+        _firebase_init_error = f"firebase_admin initialization failed: {exc}"
+        return False
+
+
+def ensure_firebase_ready_or_raise() -> None:
+    if not settings.firebase_auth_enabled:
+        return
+    if _init_firebase():
+        return
+    detail = _firebase_init_error or "unknown initialization error"
+    logger.error("Firebase bootstrap failed at startup: %s", detail)
+    raise RuntimeError(f"Firebase auth enabled but initialization failed: {detail}")
+
+
+def verify_firebase_user(token: str | None) -> dict[str, Any] | None:
+    if not settings.firebase_auth_enabled:
+        return None
+    if not token:
+        return None
+    if not _init_firebase():
+        return None
+
+    try:
+        from firebase_admin import auth
+
+        decoded = auth.verify_id_token(token)
+        return {
+            "uid": decoded.get("uid"),
+            "email": decoded.get("email"),
+            "name": decoded.get("name"),
+        }
+    except Exception:
+        return None
+
+
+def firebase_auth_health() -> dict[str, Any]:
+    enabled = settings.firebase_auth_enabled
+    initialized = _init_firebase() if enabled else False
+    return {
+        "enabled": enabled,
+        "initialized": initialized,
+        "project_id": settings.firebase_project_id,
+        "credentials_path_configured": bool(settings.firebase_credentials_path),
+        "error": _firebase_init_error if enabled and not initialized else None,
+    }
+
+
+def extract_bearer_token(authorization: str | None) -> str | None:
+    if not authorization:
+        return None
+    if not authorization.lower().startswith("bearer "):
+        return None
+    token = authorization.split(" ", 1)[1].strip()
+    return token or None

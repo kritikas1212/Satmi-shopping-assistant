@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Literal
 
-from sqlalchemy import JSON, DateTime, Float, String, Text, create_engine, select
+from sqlalchemy import JSON, DateTime, Float, String, Text, create_engine, func, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 from satmi_agent.config import settings
@@ -75,6 +75,22 @@ class AsyncTaskRecord(Base):
         onupdate=lambda: datetime.now(timezone.utc),
     )
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class ProductCatalogRecord(Base):
+    __tablename__ = "product_catalog"
+
+    product_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    title: Mapped[str] = mapped_column(String(512), index=True)
+    body_html: Mapped[str] = mapped_column(Text, default="")
+    product_type: Mapped[str] = mapped_column(String(128), default="")
+    tags: Mapped[str] = mapped_column(Text, default="")
+    vendor: Mapped[str] = mapped_column(String(256), default="")
+    status: Mapped[str] = mapped_column(String(32), index=True, default="active")
+    variants: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    searchable_text: Mapped[str] = mapped_column(Text, default="", index=True)
+    shopify_updated_at: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
 
 
 engine = create_engine(settings.database_url, future=True)
@@ -234,6 +250,75 @@ class PersistenceService:
     def get_async_task(self, task_id: str) -> AsyncTaskRecord | None:
         with self._session() as session:
             return session.get(AsyncTaskRecord, task_id)
+
+    def upsert_product_catalog(self, products: list[dict[str, Any]]) -> int:
+        if not products:
+            return 0
+
+        upserted = 0
+        now = datetime.now(timezone.utc)
+
+        with self._session() as session:
+            for item in products:
+                product_id = str(item.get("product_id") or item.get("id") or "").strip()
+                if not product_id:
+                    continue
+
+                record = session.get(ProductCatalogRecord, product_id)
+                if record is None:
+                    record = ProductCatalogRecord(product_id=product_id, title="Unknown Product")
+                    session.add(record)
+
+                record.title = str(item.get("title") or item.get("name") or record.title)
+                record.body_html = str(item.get("body_html") or "")
+                record.product_type = str(item.get("product_type") or "")
+                record.tags = str(item.get("tags") or "")
+                record.vendor = str(item.get("vendor") or "")
+                record.status = str(item.get("status") or "active")
+                variants = item.get("variants") or []
+                record.variants = variants if isinstance(variants, list) else []
+                record.searchable_text = str(item.get("searchable_text") or "")
+                record.shopify_updated_at = str(item.get("updated_at") or item.get("shopify_updated_at") or "") or None
+                record.synced_at = now
+                upserted += 1
+
+            session.commit()
+
+        return upserted
+
+    def list_product_catalog(self, limit: int | None = None) -> list[dict[str, Any]]:
+        with self._session() as session:
+            stmt = select(ProductCatalogRecord).where(ProductCatalogRecord.status == "active").order_by(ProductCatalogRecord.title.asc())
+            if limit and limit > 0:
+                stmt = stmt.limit(limit)
+            records = list(session.scalars(stmt).all())
+
+        return [
+            {
+                "id": record.product_id,
+                "title": record.title,
+                "body_html": record.body_html,
+                "product_type": record.product_type,
+                "tags": record.tags,
+                "vendor": record.vendor,
+                "status": record.status,
+                "variants": record.variants,
+                "updated_at": record.shopify_updated_at,
+            }
+            for record in records
+        ]
+
+    def get_catalog_cache_snapshot(self) -> dict[str, Any]:
+        with self._session() as session:
+            count_stmt = select(func.count(ProductCatalogRecord.product_id)).where(ProductCatalogRecord.status == "active")
+            max_sync_stmt = select(func.max(ProductCatalogRecord.synced_at))
+            product_count = int(session.scalar(count_stmt) or 0)
+            latest_sync_at = session.scalar(max_sync_stmt)
+
+        return {
+            "product_count": product_count,
+            "latest_sync_at": latest_sync_at,
+        }
 
 
 persistence_service = PersistenceService()

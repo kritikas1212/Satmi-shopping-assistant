@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from collections import deque
 import json
+import threading
 from typing import Any
 from uuid import uuid4
 
@@ -12,6 +14,8 @@ from satmi_agent.persistence import persistence_service
 class CancellationQueueService:
     def __init__(self) -> None:
         self._redis_client = None
+        self._memory_queue: deque[dict[str, Any]] = deque()
+        self._memory_lock = threading.Lock()
         if settings.redis_url:
             try:
                 import redis
@@ -47,6 +51,9 @@ class CancellationQueueService:
 
         if self._redis_client is not None:
             self._redis_client.rpush(settings.cancel_queue_key, json.dumps(payload))
+        else:
+            with self._memory_lock:
+                self._memory_queue.append(payload)
 
         return {
             "task_id": task_id,
@@ -59,7 +66,10 @@ class CancellationQueueService:
 
     def pop_next_task(self, timeout_seconds: int = 2) -> dict[str, Any] | None:
         if self._redis_client is None:
-            return None
+            with self._memory_lock:
+                if not self._memory_queue:
+                    return None
+                return self._memory_queue.popleft()
 
         item = self._redis_client.blpop(settings.cancel_queue_key, timeout=timeout_seconds)
         if not item:
@@ -67,6 +77,27 @@ class CancellationQueueService:
 
         _, payload = item
         return json.loads(payload)
+
+    def dependency_health(self) -> dict[str, Any]:
+        if self._redis_client is None:
+            return {
+                "configured": bool(settings.redis_url),
+                "reachable": False,
+                "backend": self.backend,
+            }
+        try:
+            reachable = bool(self._redis_client.ping())
+            return {
+                "configured": bool(settings.redis_url),
+                "reachable": reachable,
+                "backend": self.backend,
+            }
+        except Exception:
+            return {
+                "configured": bool(settings.redis_url),
+                "reachable": False,
+                "backend": self.backend,
+            }
 
 
 cancellation_queue_service = CancellationQueueService()

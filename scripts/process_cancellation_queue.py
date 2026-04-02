@@ -5,9 +5,6 @@ import time
 
 from satmi_agent.persistence import persistence_service
 from satmi_agent.queueing import cancellation_queue_service
-from satmi_agent.tools import tooling_service
-
-
 def process_once() -> bool:
     payload = cancellation_queue_service.pop_next_task(timeout_seconds=2)
     if payload is None:
@@ -18,11 +15,15 @@ def process_once() -> bool:
         return False
 
     persistence_service.update_async_task(task_id, status="in_progress")
-    try:
-        result = tooling_service.process_cancel_task(payload)
-        persistence_service.update_async_task(task_id, status="completed", result=result)
-    except Exception as exc:
-        persistence_service.update_async_task(task_id, status="failed", error=str(exc))
+    order_id = str(payload.get("order_id", "unknown"))
+    persistence_service.update_async_task(
+        task_id,
+        status="failed",
+        error=(
+            "Cancellation is disabled in chatbot worker. "
+            f"Please redirect customer to https://accounts.satmi.in to manage order {order_id}."
+        ),
+    )
 
     return True
 

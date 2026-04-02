@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from pathlib import Path
 import time
+from typing import Any
+from uuid import uuid4
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
+from sqlalchemy import text
 
 from satmi_agent.graph import compiled_graph
 from satmi_agent.config import settings
@@ -16,7 +21,8 @@ from satmi_agent.observability import (
     record_handoff_status,
     record_request,
 )
-from satmi_agent.persistence import persistence_service
+from satmi_agent.persistence import engine, persistence_service
+from satmi_agent.queueing import cancellation_queue_service
 from satmi_agent.schemas import (
     AsyncTaskResponse,
     ChatRequest,
@@ -26,7 +32,17 @@ from satmi_agent.schemas import (
     HandoffTicketResponse,
     ResumeHandoffRequest,
 )
-from satmi_agent.security import enforce_chat_rate_limit, require_api_key, require_support_role, scrub_pii
+from satmi_agent.security import (
+    enforce_chat_rate_limit,
+    extract_bearer_token,
+    ensure_firebase_ready_or_raise,
+    firebase_auth_health,
+    require_api_key,
+    require_support_role,
+    scrub_pii,
+    verify_firebase_user,
+)
+from satmi_agent.tools import tooling_service
 from satmi_agent.tracing import get_tracer, setup_tracing
 
 try:
@@ -38,11 +54,25 @@ except Exception:  # pragma: no cover
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     persistence_service.init_db()
+    ensure_firebase_ready_or_raise()
     setup_tracing()
     yield
 
 
 app = FastAPI(title="SATMI Agent API", version="0.1.0", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://satmi.in",
+        "https://www.satmi.in",
+        "https://accounts.satmi.in",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.middleware("http")
@@ -72,12 +102,89 @@ def _to_iso(value) -> str | None:
     return value.isoformat() if value else None
 
 
+def _mask_secret(value: str | None, *, visible_prefix: int = 4) -> str | None:
+    if not value:
+        return None
+    prefix = value[:visible_prefix]
+    return f"{prefix}..."
+
+
+def _mask_database_url(value: str) -> str:
+    if not value:
+        return "unset"
+    # Keep dialect and target host:port while masking credentials.
+    if "://" not in value:
+        return "configured"
+
+    scheme, remainder = value.split("://", 1)
+    host_part = remainder
+    if "@" in remainder:
+        host_part = remainder.split("@", 1)[1]
+    host_port = host_part.split("/", 1)[0]
+    return f"{scheme}://***@{host_port}"
+
+
+def _mask_path(value: str | None) -> str | None:
+    if not value:
+        return None
+    name = Path(value).name
+    return f".../{name}"
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.get("/metrics")
+@app.get("/system/config")
+def system_config(_: None = Depends(require_support_role)) -> dict[str, object]:
+    return {
+        "app_env": settings.app_env,
+        "api_port": settings.api_port,
+        "database_url": _mask_database_url(settings.database_url),
+        "redis_enabled": bool(settings.redis_url),
+        "redis_url": _mask_database_url(settings.redis_url) if settings.redis_url else None,
+        "llm_provider": settings.llm_provider,
+        "model_name": settings.model_name,
+        "gemini_api_key": _mask_secret(settings.gemini_api_key),
+        "shopify_store_domain": settings.shopify_store_domain,
+        "shopify_admin_api_token": _mask_secret(settings.shopify_admin_api_token),
+        "display_currency_code": settings.display_currency_code,
+        "firebase_auth_enabled": settings.firebase_auth_enabled,
+        "firebase_project_id": settings.firebase_project_id,
+        "firebase_credentials_path": _mask_path(settings.firebase_credentials_path),
+        "firebase_require_for_sensitive_actions": settings.firebase_require_for_sensitive_actions,
+    }
+
+
+@app.get("/system/healthz/deps")
+def system_healthz_deps(_: None = Depends(require_support_role)) -> dict[str, object]:
+    postgres = {"configured": bool(settings.database_url), "reachable": False}
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+            postgres["reachable"] = True
+    except Exception as exc:
+        postgres["error"] = str(exc)
+
+    redis = cancellation_queue_service.dependency_health()
+    firebase = firebase_auth_health()
+    shopify = tooling_service.shopify_health()
+
+    all_healthy = bool(postgres.get("reachable")) and bool(redis.get("reachable")) and bool(shopify.get("reachable"))
+
+    return {
+        "overall": "healthy" if all_healthy else "degraded",
+        "dependencies": {
+            "firebase": firebase,
+            "postgres": postgres,
+            "redis": redis,
+            "shopify": shopify,
+        },
+    }
+
+
+@app.get(settings.metrics_endpoint_path)
 def metrics(_: None = Depends(require_support_role)) -> Response:
     if not settings.metrics_endpoint_enabled:
         raise HTTPException(status_code=404, detail="Metrics endpoint disabled")
@@ -87,9 +194,23 @@ def metrics(_: None = Depends(require_support_role)) -> Response:
 
 
 @app.post("/chat", response_model=ChatResponse)
-def chat(request: ChatRequest, http_request: Request, _: None = Depends(require_api_key)) -> ChatResponse:
+def chat(
+    request: ChatRequest,
+    http_request: Request,
+    authorization: str | None = Header(default=None),
+    x_firebase_token: str | None = Header(default=None),
+    _: None = Depends(require_api_key),
+) -> ChatResponse:
     enforce_chat_rate_limit(http_request, request.user_id)
     masked_user_message = scrub_pii(request.message)
+    firebase_token = x_firebase_token or extract_bearer_token(authorization)
+    firebase_user = verify_firebase_user(firebase_token)
+    order_context: list[dict[str, Any]] = []
+
+    if firebase_user:
+        # Load recent order context for this authenticated user to avoid repeat prompts.
+        order_data = tooling_service.get_customer_orders(request.user_id)
+        order_context = order_data.get("orders", [])
 
     persistence_service.create_conversation_event(
         conversation_id=request.conversation_id,
@@ -100,20 +221,43 @@ def chat(request: ChatRequest, http_request: Request, _: None = Depends(require_
         event_metadata={"event": "user_message"},
     )
 
-    final_state = compiled_graph.invoke(
-        {
-            "user_id": request.user_id,
-            "conversation_id": request.conversation_id,
-            "message": masked_user_message,
-            "status": "active",
-            "errors": [],
-            "internal_logs": [],
-            "message_history": [
-                {"role": "user", "content": masked_user_message},
-            ],
-        },
-        config={"configurable": {"thread_id": request.conversation_id}},
-    )
+    try:
+        final_state = compiled_graph.invoke(
+            {
+                "user_id": request.user_id,
+                "conversation_id": request.conversation_id,
+                "message": masked_user_message,
+                "status": "active",
+                "user_authenticated": bool(firebase_user),
+                "authenticated_user": firebase_user,
+                "order_context": order_context,
+                "errors": [],
+                "internal_logs": [],
+                "message_history": [
+                    {"role": "user", "content": masked_user_message},
+                ],
+            },
+            config={"configurable": {"thread_id": request.conversation_id}},
+        )
+    except Exception as exc:
+        fallback_handoff_id = f"HND-{uuid4().hex[:8].upper()}"
+        final_state = {
+            "status": "awaiting_human",
+            "intent": "unknown",
+            "confidence": 0.0,
+            "handoff_id": fallback_handoff_id,
+            "handoff_reason": "Graph execution failed",
+            "action": "none",
+            "tool_result": {},
+            "errors": [f"Graph execution failed: {exc}"],
+            "internal_logs": [{"event": "graph_invoke_failed"}],
+            "response": (
+                "I am handing this over to a SATMI support specialist now. "
+                f"Your handoff reference is {fallback_handoff_id}. "
+                "Estimated response time is about 15 minutes."
+            ),
+            "message_history": [{"role": "user", "content": masked_user_message}],
+        }
 
     message_history = final_state.get("message_history", [])
     if final_state.get("response"):
@@ -158,6 +302,10 @@ def chat(request: ChatRequest, http_request: Request, _: None = Depends(require_
             "handoff_reason": final_state.get("handoff_reason"),
             "async_task_id": final_state.get("async_task_id"),
             "async_task_status": final_state.get("async_task_status"),
+            "user_authenticated": bool(firebase_user),
+            "auth_user_uid": firebase_user.get("uid") if firebase_user else None,
+            "order_context_count": len(order_context),
+            "catalog_source": (final_state.get("tool_result") or {}).get("source"),
             "errors": scrub_pii(final_state.get("errors", [])),
             "internal_logs": scrub_pii(final_state.get("internal_logs", [])),
             "message_history": scrub_pii(message_history),

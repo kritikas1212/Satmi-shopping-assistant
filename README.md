@@ -130,6 +130,14 @@ export PYTHONPATH=src
 uvicorn satmi_agent.main:app --reload --port 8000
 ```
 
+One-shot startup (preflight + Firebase JSON validation + API/worker + diagnostics):
+
+```bash
+./scripts/start_local_stack.sh
+```
+
+This script reads `.env`, checks required settings, validates `FIREBASE_CREDENTIALS_PATH` JSON when Firebase auth is enabled, starts both API and worker, then runs `/health`, `/system/healthz/deps`, `/system/config`, and a `/chat` smoke request automatically.
+
 Set database for dev/prod:
 
 ```bash

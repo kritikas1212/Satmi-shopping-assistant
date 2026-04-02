@@ -15,6 +15,7 @@ class AgentState(TypedDict, total=False):
     confidence: float
     requested_human: bool
     out_of_scope: bool
+    highly_frustrated: bool
     status: Status
     action: str
     policy_ok: bool
@@ -34,3 +35,6 @@ class AgentState(TypedDict, total=False):
     async_task_status: str
     resumed_by_human: bool
     human_resolution_message: str
+    user_authenticated: bool
+    authenticated_user: dict[str, Any]
+    order_context: list[dict[str, Any]]

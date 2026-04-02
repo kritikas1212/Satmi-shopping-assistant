@@ -5,6 +5,7 @@ import json
 import httpx
 
 from satmi_agent.config import settings
+from satmi_agent.prompt_loader import get_system_prompt
 
 
 def refine_response_with_llm(*, user_message: str, base_response: str, policy_context: list[dict[str, str]] | None = None) -> str:
@@ -17,18 +18,20 @@ def refine_response_with_llm(*, user_message: str, base_response: str, policy_co
     if not settings.gemini_api_key:
         return base_response
 
+    system_prompt = get_system_prompt()
+
     context_lines = []
     for item in policy_context or []:
         title = str(item.get("title", "Policy"))
         content = str(item.get("content", ""))
         context_lines.append(f"- {title}: {content}")
 
-    prompt = (
-        "You are SATMI customer assistant. Rewrite the response to be concise, clear, and policy-safe. "
-        "Do not add new facts. Preserve order ids, status, and key actions exactly.\n\n"
+    user_prompt = (
         f"User message: {user_message}\n"
         f"Draft response: {base_response}\n"
-        f"Policy context:\n{chr(10).join(context_lines) if context_lines else '- none'}\n"
+        f"Policy context:\n{chr(10).join(context_lines) if context_lines else '- none'}\n\n"
+        "Rewrite the draft response following your system instructions. "
+        "Do not add new facts. Preserve order IDs, statuses, and key actions exactly."
     )
 
     endpoint = (
@@ -36,7 +39,10 @@ def refine_response_with_llm(*, user_message: str, base_response: str, policy_co
         f"?key={settings.gemini_api_key}"
     )
     payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
+        "system_instruction": {
+            "parts": [{"text": system_prompt}]
+        },
+        "contents": [{"parts": [{"text": user_prompt}]}],
         "generationConfig": {"temperature": 0.2, "maxOutputTokens": 240},
     }
 

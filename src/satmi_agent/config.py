@@ -28,11 +28,22 @@ class Settings(BaseSettings):
     tracing_otlp_endpoint: str = "http://localhost:4318/v1/traces"
     tracing_timeout_seconds: float = 5.0
     policy_kb_path: str = "./data/policy_kb.json"
+    system_prompt_path: str = "./data/system_prompt.md"
     policy_retrieval_max_items: int = 3
     hitl_interrupt_enabled: bool = False
     async_cancel_enabled: bool = False
     redis_url: str | None = None
     cancel_queue_key: str = "satmi:cancel:queue"
+    display_currency_code: str = "INR"
+    usd_to_inr_rate: float = 83.0
+    firebase_auth_enabled: bool = False
+    firebase_credentials_path: str | None = None
+    firebase_project_id: str | None = None
+    firebase_require_for_sensitive_actions: bool = True
+    catalog_cache_enabled: bool = True
+    catalog_cache_ttl_seconds: int = 600
+    catalog_cache_max_products: int = 3000
+    catalog_search_result_limit: int = 8
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 

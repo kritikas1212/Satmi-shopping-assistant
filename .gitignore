@@ -5,3 +5,5 @@ pycache/
 satmi_agent.db
 .pytest_cache/
 .DS_Store
+.logs/
+*-firebase-adminsdk-*.json

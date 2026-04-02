@@ -110,9 +110,12 @@ def test_metrics_endpoint_requires_support_role_when_auth_enabled() -> None:
     settings.api_key = "secret"
 
     with TestClient(app) as client:
-        unauthorized = client.get("/metrics")
-        forbidden = client.get("/metrics", headers={"X-API-Key": "secret"})
-        allowed = client.get("/metrics", headers={"X-API-Key": "secret", "X-Role": "support_agent"})
+        unauthorized = client.get(settings.metrics_endpoint_path)
+        forbidden = client.get(settings.metrics_endpoint_path, headers={"X-API-Key": "secret"})
+        allowed = client.get(
+            settings.metrics_endpoint_path,
+            headers={"X-API-Key": "secret", "X-Role": "support_agent"},
+        )
 
     assert unauthorized.status_code == 401
     assert forbidden.status_code == 403
@@ -124,7 +127,10 @@ def test_metrics_payload_contains_satmi_metrics() -> None:
     settings.api_key = "secret"
 
     with TestClient(app) as client:
-        response = client.get("/metrics", headers={"X-API-Key": "secret", "X-Role": "support_agent"})
+        response = client.get(
+            settings.metrics_endpoint_path,
+            headers={"X-API-Key": "secret", "X-Role": "support_agent"},
+        )
 
     assert response.status_code == 200
     text = response.text
