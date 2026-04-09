@@ -34,13 +34,12 @@ from satmi_agent.schemas import (
 )
 from satmi_agent.security import (
     enforce_chat_rate_limit,
-    extract_bearer_token,
     ensure_firebase_ready_or_raise,
     firebase_auth_health,
     require_api_key,
     require_support_role,
     scrub_pii,
-    verify_firebase_user,
+    verify_firebase_token,
 )
 from satmi_agent.tools import tooling_service
 from satmi_agent.tracing import get_tracer, setup_tracing
@@ -60,15 +59,31 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="SATMI Agent API", version="0.1.0", lifespan=lifespan)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
+
+
+def _cors_allow_origins() -> list[str]:
+    origins = {
         "https://satmi.in",
         "https://www.satmi.in",
         "https://accounts.satmi.in",
         "http://localhost:3000",
         "http://127.0.0.1:3000",
-    ],
+    }
+    domain = (settings.shopify_store_domain or "").strip().strip('"').strip("'")
+    if domain:
+        if domain.startswith("http://") or domain.startswith("https://"):
+            domain = domain.split("://", 1)[1]
+        domain = domain.strip("/")
+        if domain:
+            origins.add(f"https://{domain}")
+            origins.add(f"http://{domain}")
+    return sorted(origins)
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_allow_origins(),
+    allow_origin_regex=r"https://([a-zA-Z0-9-]+\.)?(myshopify\.com|shopify\.com)$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -129,6 +144,182 @@ def _mask_path(value: str | None) -> str | None:
         return None
     name = Path(value).name
     return f".../{name}"
+
+
+def _load_recent_message_history(conversation_id: str, limit: int = 12) -> list[dict[str, str]]:
+    """Load recent chat turns so each graph invocation has conversational memory."""
+    try:
+        events = persistence_service.list_conversation_events(conversation_id, limit=limit)
+    except Exception:
+        return []
+
+    history: list[dict[str, str]] = []
+    for event in events:
+        role = str(event.role or "").strip().lower()
+        if role not in {"user", "assistant", "system"}:
+            continue
+        content = str(event.message or "").strip()
+        if not content:
+            continue
+        history.append({"role": role, "content": content})
+    return history
+
+
+def _invoke_chat_graph(
+    *,
+    request: ChatRequest,
+    firebase_user: dict[str, Any] | None,
+    order_context: list[dict[str, Any]],
+    masked_user_message: str,
+    message_history: list[dict[str, str]],
+) -> dict[str, Any]:
+    try:
+        return compiled_graph.invoke(
+            {
+                "user_id": request.user_id,
+                "conversation_id": request.conversation_id,
+                "message": masked_user_message,
+                "status": "active",
+                "user_authenticated": bool(firebase_user),
+                "authenticated_user": firebase_user,
+                "order_context": order_context,
+                "errors": [],
+                "internal_logs": [],
+                "message_history": message_history,
+            },
+            config={"configurable": {"thread_id": request.conversation_id}, "recursion_limit": 50},
+        )
+    except Exception as exc:
+        fallback_handoff_id = f"HND-{uuid4().hex[:8].upper()}"
+        return {
+            "status": "awaiting_human",
+            "intent": "unknown",
+            "confidence": 0.0,
+            "handoff_id": fallback_handoff_id,
+            "handoff_reason": "Graph execution failed",
+            "action": "none",
+            "tool_result": {},
+            "errors": [f"Graph execution failed: {exc}"],
+            "internal_logs": [{"event": "graph_invoke_failed"}],
+            "response": (
+                "I am handing this over to a SATMI support specialist now. "
+                f"Your handoff reference is {fallback_handoff_id}. "
+                "Estimated response time is about 15 minutes."
+            ),
+            "message_history": message_history,
+        }
+
+
+def _coerce_recommended_products(final_state: dict[str, Any]) -> list[dict[str, Any]]:
+    intent = str(final_state.get("intent", "")).strip().lower()
+    if intent not in {"shopping", "order_tracking"}:
+        return []
+
+    products = final_state.get("recommended_products")
+    if isinstance(products, list) and products:
+        return products
+
+    fallback_results = (final_state.get("tool_result") or {}).get("results")
+    if not isinstance(fallback_results, list):
+        return []
+
+    normalized: list[dict[str, Any]] = []
+    for item in fallback_results[:8]:
+        if not isinstance(item, dict):
+            continue
+        normalized.append(
+            {
+                "product_id": str(item.get("product_id") or item.get("id") or "") or None,
+                "variant_id": str(item.get("variant_id") or "") or None,
+                "handle": str(item.get("handle") or "") or None,
+                "url": item.get("url") or item.get("product_url"),
+                "title": str(item.get("title") or item.get("name") or "SATMI Product"),
+                "price": str(item.get("price") or ""),
+                "image_url": item.get("image_url") or item.get("image"),
+                "product_url": item.get("product_url") or item.get("url"),
+            }
+        )
+    return normalized
+
+
+def _safe_recommended_products(products: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return frontend-safe product payload without applying generic PII masking to URLs.
+
+    URL/image fields can contain long numeric segments that are incorrectly redacted by
+    phone-number masking, which breaks thumbnails and product links.
+    """
+    safe_products: list[dict[str, Any]] = []
+    for item in products[:8]:
+        if not isinstance(item, dict):
+            continue
+        safe_products.append(
+            {
+                "product_id": item.get("product_id"),
+                "variant_id": item.get("variant_id"),
+                "handle": item.get("handle"),
+                "url": item.get("url"),
+                "title": item.get("title"),
+                "price": item.get("price"),
+                "image_url": item.get("image_url"),
+                "product_url": item.get("product_url"),
+            }
+        )
+    return safe_products
+
+
+def _fallback_recommended_products(user_message: str) -> tuple[list[dict[str, Any]], str | None]:
+    """Last-mile backend safeguard to keep card rendering available in all chat responses."""
+    try:
+        fallback_query = user_message.strip() if user_message and user_message.strip() else "SATMI best sellers"
+        tool_payload = tooling_service.search_products(fallback_query)
+        fallback_results = tool_payload.get("results") if isinstance(tool_payload, dict) else []
+        if isinstance(fallback_results, list) and fallback_results:
+            normalized = _safe_recommended_products(
+                [
+                    {
+                        "product_id": item.get("product_id") or item.get("id"),
+                        "variant_id": item.get("variant_id"),
+                        "handle": item.get("handle"),
+                        "url": item.get("url") or item.get("product_url"),
+                        "title": item.get("title") or item.get("name") or "SATMI Product",
+                        "price": item.get("price"),
+                        "image_url": item.get("image_url") or item.get("image"),
+                        "product_url": item.get("product_url") or item.get("url"),
+                    }
+                    for item in fallback_results[:8]
+                    if isinstance(item, dict)
+                ]
+            )
+            source = str(tool_payload.get("source") or "fallback_search") if isinstance(tool_payload, dict) else "fallback_search"
+            return normalized, source
+    except Exception:
+        pass
+
+    return [], None
+
+
+def _is_product_related_query(message: str) -> bool:
+    lowered = (message or "").lower()
+    product_hints = {
+        "recommend",
+        "product",
+        "products",
+        "buy",
+        "purchase",
+        "shop",
+        "show",
+        "find",
+        "suggest",
+        "rudraksha",
+        "karungali",
+        "crystal",
+        "bracelet",
+        "mala",
+        "ring",
+        "necklace",
+        "pendant",
+    }
+    return any(token in lowered for token in product_hints)
 
 
 @app.get("/health")
@@ -193,24 +384,15 @@ def metrics(_: None = Depends(require_support_role)) -> Response:
     return Response(content=payload, media_type=content_type)
 
 
-@app.post("/chat", response_model=ChatResponse)
+@app.post("/chat")
 def chat(
     request: ChatRequest,
     http_request: Request,
-    authorization: str | None = Header(default=None),
-    x_firebase_token: str | None = Header(default=None),
     _: None = Depends(require_api_key),
-) -> ChatResponse:
+) -> ChatResponse | dict[str, Any]:
     enforce_chat_rate_limit(http_request, request.user_id)
-    masked_user_message = scrub_pii(request.message)
-    firebase_token = x_firebase_token or extract_bearer_token(authorization)
-    firebase_user = verify_firebase_user(firebase_token)
+    masked_user_message = scrub_pii(request.message or "")
     order_context: list[dict[str, Any]] = []
-
-    if firebase_user:
-        # Load recent order context for this authenticated user to avoid repeat prompts.
-        order_data = tooling_service.get_customer_orders(request.user_id)
-        order_context = order_data.get("orders", [])
 
     persistence_service.create_conversation_event(
         conversation_id=request.conversation_id,
@@ -221,45 +403,22 @@ def chat(
         event_metadata={"event": "user_message"},
     )
 
-    try:
-        final_state = compiled_graph.invoke(
-            {
-                "user_id": request.user_id,
-                "conversation_id": request.conversation_id,
-                "message": masked_user_message,
-                "status": "active",
-                "user_authenticated": bool(firebase_user),
-                "authenticated_user": firebase_user,
-                "order_context": order_context,
-                "errors": [],
-                "internal_logs": [],
-                "message_history": [
-                    {"role": "user", "content": masked_user_message},
-                ],
-            },
-            config={"configurable": {"thread_id": request.conversation_id}},
-        )
-    except Exception as exc:
-        fallback_handoff_id = f"HND-{uuid4().hex[:8].upper()}"
-        final_state = {
-            "status": "awaiting_human",
-            "intent": "unknown",
-            "confidence": 0.0,
-            "handoff_id": fallback_handoff_id,
-            "handoff_reason": "Graph execution failed",
-            "action": "none",
-            "tool_result": {},
-            "errors": [f"Graph execution failed: {exc}"],
-            "internal_logs": [{"event": "graph_invoke_failed"}],
-            "response": (
-                "I am handing this over to a SATMI support specialist now. "
-                f"Your handoff reference is {fallback_handoff_id}. "
-                "Estimated response time is about 15 minutes."
-            ),
-            "message_history": [{"role": "user", "content": masked_user_message}],
-        }
+    message_history = _load_recent_message_history(request.conversation_id, limit=14)
+    if not message_history or message_history[-1].get("content") != masked_user_message:
+        message_history = [
+            *message_history,
+            {"role": "user", "content": masked_user_message},
+        ]
 
-    message_history = final_state.get("message_history", [])
+    final_state = _invoke_chat_graph(
+        request=request,
+        firebase_user=None,
+        order_context=order_context,
+        masked_user_message=masked_user_message,
+        message_history=message_history,
+    )
+
+    message_history = final_state.get("message_history", message_history)
     if final_state.get("response"):
         message_history = [
             *message_history,
@@ -286,6 +445,9 @@ def chat(
 
     status_value = final_state.get("status", "active")
     intent_value = final_state.get("intent", "unknown")
+    recommended_products = _safe_recommended_products(_coerce_recommended_products(final_state))
+    recommendation_source = (final_state.get("tool_result") or {}).get("source")
+
     record_chat_outcome(status=status_value, intent=intent_value)
     if final_state.get("handoff_id"):
         record_handoff_created(final_state.get("handoff_reason", "unspecified"))
@@ -293,19 +455,22 @@ def chat(
     return ChatResponse(
         conversation_id=request.conversation_id,
         status=final_state.get("status", "active"),
-        response=scrub_pii(final_state.get("response", "I am here to help.")),
+        response_text=scrub_pii(final_state.get("response_text") or final_state.get("response", "I am here to help.")),
+        recommended_products=recommended_products,
+        auth_required=False,
         intent=final_state.get("intent", "unknown"),
         confidence=final_state.get("confidence", 0.0),
         handoff_id=final_state.get("handoff_id"),
         metadata={
-            "action": final_state.get("action"),
+            "action": final_state.get("action") or (request.action or "chat"),
             "handoff_reason": final_state.get("handoff_reason"),
             "async_task_id": final_state.get("async_task_id"),
             "async_task_status": final_state.get("async_task_status"),
-            "user_authenticated": bool(firebase_user),
-            "auth_user_uid": firebase_user.get("uid") if firebase_user else None,
+            "user_authenticated": False,
+            "auth_user_uid": None,
             "order_context_count": len(order_context),
-            "catalog_source": (final_state.get("tool_result") or {}).get("source"),
+            "catalog_source": recommendation_source,
+            "recommendation_count": len(recommended_products),
             "errors": scrub_pii(final_state.get("errors", [])),
             "internal_logs": scrub_pii(final_state.get("internal_logs", [])),
             "message_history": scrub_pii(message_history),
@@ -432,7 +597,7 @@ def resume_handoff(
     record_handoff_status("resolved")
 
     resumed_response = scrub_pii(request.agent_message)
-    resumed_intent = "support"
+    resumed_intent = "general"
     resumed_confidence = 1.0
 
     if settings.hitl_interrupt_enabled and Command is not None:
@@ -442,7 +607,7 @@ def resume_handoff(
                 config={"configurable": {"thread_id": record.conversation_id}},
             )
             resumed_response = scrub_pii(resumed_state.get("response", resumed_response))
-            resumed_intent = resumed_state.get("intent", "support")
+            resumed_intent = resumed_state.get("intent", "general")
             resumed_confidence = resumed_state.get("confidence", 1.0)
         except Exception:
             resumed_response = scrub_pii(request.agent_message)
@@ -460,7 +625,9 @@ def resume_handoff(
     return ChatResponse(
         conversation_id=record.conversation_id,
         status="resolved",
-        response=resumed_response,
+        response_text=resumed_response,
+        recommended_products=[],
+        auth_required=False,
         intent=resumed_intent,
         confidence=resumed_confidence,
         handoff_id=handoff_id,

@@ -3,9 +3,18 @@ from __future__ import annotations
 import re
 from typing import Any
 import logging
+from pathlib import Path
+import json
+from datetime import datetime, timezone
 
+from satmi_agent.config.persona import FINAL_SYSTEM_PROMPT as SATMI_SYSTEM_PROMPT
 from satmi_agent.config import settings
-from satmi_agent.llm import refine_response_with_llm
+from satmi_agent.llm import (
+    classify_intent_with_llm,
+    compose_structured_response_with_llm,
+    extract_search_keywords_with_llm,
+    generate_general_conversation_response,
+)
 from satmi_agent.persistence import persistence_service
 from satmi_agent.policy import detect_guardrail_issues, retrieve_policy_context
 from satmi_agent.queueing import cancellation_queue_service
@@ -29,6 +38,55 @@ SUPPORT_KEYWORDS = {
     "delivery",
     "issue",
     "problem",
+}
+BRAND_FAQ_KEYWORDS = {
+    "satmi",
+    "brand",
+    "about",
+    "who",
+    "shipping",
+    "delivery",
+    "international",
+    "policy",
+    "policies",
+    "exchange",
+    "store",
+}
+POLICY_QUESTION_KEYWORDS = {
+    "policy",
+    "policies",
+    "shipping",
+    "delivery",
+    "international",
+    "privacy",
+}
+POLICY_QUESTION_PHRASES = {
+    "return policy",
+    "refund policy",
+    "shipping policy",
+    "cancellation policy",
+    "privacy policy",
+}
+BRAND_FAQ_PHRASES = {
+    "what is satmi",
+    "who are you",
+    "about satmi",
+    "do you ship internationally",
+    "shipping policy",
+    "return policy",
+    "refund policy",
+}
+GREETING_WORDS = {"hi", "hello", "hey", "namaste", "hii", "yo"}
+CONVERSATIONAL_KEYWORDS = {
+    "how",
+    "why",
+    "what",
+    "thanks",
+    "thank",
+    "help",
+    "guide",
+    "tell",
+    "explain",
 }
 SHOPPING_KEYWORDS = {
     "buy",
@@ -71,7 +129,16 @@ FRUSTRATION_KEYWORDS = {
     "fuck",
 }
 ORDER_TRACKING_HINTS = {"track", "shipment", "delivery", "status", "where", "latest", "my"}
-SATMI_ACCOUNTS_URL = "https://accounts.satmi.in"
+SELECT_PRODUCT_INTENT_PATTERN = re.compile(
+    r"\[SYSTEM_INTENT:\s*SELECT_PRODUCT\]\s*ID:\s*([^,\n]+),\s*Name:\s*(.+)",
+    re.IGNORECASE,
+)
+AUTHENTICATION_INTENT_PATTERNS = (
+    r"\bsign\s*in\b",
+    r"\blog\s*in\b",
+    r"\blogin\b",
+    r"\bauthenticate(?:d|ion)?\b",
+)
 PRODUCT_INFO_KEYWORDS = {
     "mala",
     "bead",
@@ -90,6 +157,57 @@ PRODUCT_INFO_KEYWORDS = {
 }
 COMPARE_KEYWORDS = {"compare", "comparison", "versus", "vs", "difference", "better"}
 DISCOVERY_KEYWORDS = {"list", "show", "find", "tell", "about", "options"}
+TEMP_AI_CORE_ISSUE_MESSAGE = (
+    "I am currently experiencing a temporary connection issue to my AI core. "
+    "Please try asking your question again in a moment."
+)
+SEARCH_STOPWORDS = {
+    "i",
+    "need",
+    "want",
+    "to",
+    "buy",
+    "please",
+    "show",
+    "me",
+    "find",
+    "for",
+    "my",
+    "a",
+    "an",
+    "the",
+    "some",
+    "with",
+    "and",
+    "of",
+    "in",
+    "on",
+    "at",
+    "order",
+    "place",
+    "checkout",
+}
+
+DEFAULT_DISCOVERY_QUERY = "Karungali Rudraksha Rose Quartz"
+
+BEST_SELLER_HINTS = {"best", "seller", "sellers", "trending", "popular", "top"}
+PRODUCT_FORCE_HINTS = {
+    "recommend",
+    "recommendation",
+    "recommendations",
+    "suggest",
+    "suggestion",
+    "product",
+    "products",
+    "item",
+    "items",
+    "catalog",
+    "shop",
+    "browse",
+    "buy",
+    "purchase",
+    "checkout",
+}
 
 
 def _tokenize(text: str) -> set[str]:
@@ -121,8 +239,38 @@ def _extract_quantity(message: str) -> int:
     return 1
 
 
+def _parse_selected_product_intent(message: str) -> tuple[str, str] | None:
+    match = SELECT_PRODUCT_INTENT_PATTERN.search(message or "")
+    if not match:
+        return None
+    product_id = str(match.group(1) or "").strip()
+    product_name = str(match.group(2) or "").strip()
+    if not product_id and not product_name:
+        return None
+    return product_id, product_name
+
+
 def _state_logs(state: AgentState) -> list[dict[str, Any]]:
     return state.get("internal_logs") or state.get("audit_log", [])
+
+
+def _ensure_system_message_first(history: list[dict[str, str]] | None) -> list[dict[str, str]]:
+    """Return history with exactly one SATMI system prompt at index 0.
+
+    We aggressively normalize to avoid stale, duplicated, or malformed
+    system messages reaching the LLM call path.
+    """
+    normalized: list[dict[str, str]] = []
+    for item in history or []:
+        role = str(item.get("role", "")).strip().lower()
+        content = str(item.get("content", "")).strip()
+        if not role or not content:
+            continue
+        if role == "system":
+            continue
+        normalized.append({"role": role, "content": content})
+
+    return [{"role": "system", "content": SATMI_SYSTEM_PROMPT}, *normalized]
 
 
 def _looks_like_product_query(message: str, words: set[str]) -> bool:
@@ -153,9 +301,59 @@ def _is_knowledge_query(message: str) -> bool:
     )
 
 
+def _contains_authentication_intent(message: str) -> bool:
+    lowered = message.lower()
+    return any(re.search(pattern, lowered) for pattern in AUTHENTICATION_INTENT_PATTERNS)
+
+
+def _extract_search_query(message: str) -> str:
+    """Extract a concise 1-3 word catalog query from conversational text."""
+    llm_query = extract_search_keywords_with_llm(user_message=message)
+    if llm_query:
+        return llm_query
+
+    text = message.lower()
+    chunks = re.split(r"\b(?:vs|versus|and|with|for)\b", text)
+    candidate = chunks[0] if chunks else text
+    tokens = re.findall(r"[a-zA-Z0-9']+", candidate)
+    filtered = [tok for tok in tokens if tok not in SEARCH_STOPWORDS and len(tok) > 1]
+
+    if not filtered:
+        filtered = [tok for tok in tokens if len(tok) > 1]
+    if not filtered:
+        return "product"
+
+    # Prefer known product/material words when present.
+    preferred = [tok for tok in filtered if tok in PRODUCT_INFO_KEYWORDS or tok in {"karungali", "rudraksha", "crystal"}]
+    shortlist = preferred[:3] if preferred else filtered[:3]
+    return " ".join(shortlist).strip() or "product"
+
+
 def _is_comparison_request(message: str, words: set[str]) -> bool:
     lowered = message.lower()
     return bool(words.intersection(COMPARE_KEYWORDS)) or " vs " in lowered
+
+
+def _is_best_sellers_query(message: str, words: set[str]) -> bool:
+    lowered = message.lower()
+    return ("best seller" in lowered) or ({"best", "sellers"}.issubset(words))
+
+
+def _must_force_product_tool_usage(message: str, words: set[str]) -> bool:
+    lowered = message.lower()
+    if _is_brand_faq(message, words) or _is_policy_question(message, words):
+        return False
+
+    if not _is_store_related(message, words):
+        return False
+
+    return (
+        _is_best_sellers_query(message, words)
+        or bool(words.intersection(PRODUCT_FORCE_HINTS))
+        or "recommend me" in lowered
+        or "show me" in lowered
+        or "faq best sellers" in lowered
+    )
 
 
 def _requested_human_assistance(message: str, words: set[str]) -> bool:
@@ -174,6 +372,37 @@ def _is_legal_or_financial_dispute(message: str, words: set[str]) -> bool:
 
 def _is_highly_frustrated(words: set[str]) -> bool:
     return bool(words.intersection(FRUSTRATION_KEYWORDS))
+
+
+def _is_brand_faq(message: str, words: set[str]) -> bool:
+    lowered = message.lower().strip()
+    if lowered in GREETING_WORDS:
+        return True
+    if any(phrase in lowered for phrase in BRAND_FAQ_PHRASES):
+        return True
+    if lowered.startswith("what is satmi") or lowered.startswith("who are you"):
+        return True
+    return bool(words.intersection(BRAND_FAQ_KEYWORDS) and "order" not in words and "buy" not in words)
+
+
+def _is_policy_question(message: str, words: set[str]) -> bool:
+    lowered = message.lower().strip()
+    if "order" in words and any(keyword in words for keyword in {"cancel", "track", "status"}):
+        return False
+    if any(phrase in lowered for phrase in POLICY_QUESTION_PHRASES):
+        return True
+    if lowered.startswith("what is your") and "policy" in lowered:
+        return True
+    return bool(words.intersection(POLICY_QUESTION_KEYWORDS))
+
+
+def _is_conversational_query(message: str, words: set[str]) -> bool:
+    lowered = message.lower().strip()
+    if lowered in GREETING_WORDS:
+        return True
+    if lowered.endswith("?") and len(words) <= 16:
+        return True
+    return bool(words.intersection(CONVERSATIONAL_KEYWORDS))
 
 
 def _comparison_history_hint(state: AgentState) -> str:
@@ -200,6 +429,155 @@ def _comparison_history_hint(state: AgentState) -> str:
     return " ".join(merged.split())[:400]
 
 
+def _extract_user_preferences(*, messages: list[str]) -> dict[str, Any]:
+    joined = " ".join(messages).lower()
+    prefs: dict[str, Any] = {}
+
+    budget_match = re.search(r"(?:under|below|budget)\s*(?:inr|rs\.?|₹)?\s*(\d{2,6})", joined)
+    if budget_match:
+        prefs["budget_inr"] = int(budget_match.group(1))
+
+    categories = ["bracelet", "mala", "necklace", "ring", "crystal", "pendant"]
+    preferred_categories = [cat for cat in categories if re.search(rf"\b{cat}s?\b", joined)]
+    if preferred_categories:
+        prefs["preferred_categories"] = sorted(set(preferred_categories))
+
+    materials = ["karungali", "rudraksha", "crystal", "silver", "wood"]
+    preferred_materials = [mat for mat in materials if re.search(rf"\b{mat}\b", joined)]
+    if preferred_materials:
+        prefs["preferred_materials"] = sorted(set(preferred_materials))
+
+    return prefs
+
+
+def _conversation_summary(state: AgentState, limit: int = 10) -> str:
+    turns: list[str] = []
+    for item in state.get("message_history", [])[-limit:]:
+        role = str(item.get("role", "user")).strip()
+        content = str(item.get("content", "")).strip()
+        if content:
+            turns.append(f"{role}: {content}")
+    return "\n".join(turns)
+
+
+def _build_product_snippets(tool_result: dict[str, Any], max_items: int = 3) -> list[dict[str, Any]]:
+    snippets: list[dict[str, Any]] = []
+    for item in (tool_result.get("results") or [])[:max_items]:
+        title = str(item.get("title") or item.get("name") or "").strip()
+        if not title:
+            continue
+        snippets.append(
+            {
+                "title": title,
+                "price": item.get("price"),
+                "currency": item.get("currency"),
+                "material": item.get("material") or item.get("product_type"),
+                "benefits": str(item.get("description", "")).strip()[:180],
+                "product_url": item.get("product_url"),
+                "image_url": item.get("image_url"),
+            }
+        )
+    return snippets
+
+
+def _is_store_related(message: str, words: set[str]) -> bool:
+    return bool(
+        words.intersection(BRAND_FAQ_KEYWORDS)
+        or words.intersection(POLICY_QUESTION_KEYWORDS)
+        or words.intersection(SHOPPING_KEYWORDS)
+        or words.intersection(PRODUCT_INFO_KEYWORDS)
+        or any(token in message.lower() for token in ["satmi", "shipping", "refund", "return", "karungali", "rudraksha"])
+    )
+
+
+def _comparison_requested(state: AgentState, tool_result: dict[str, Any]) -> bool:
+    words = _tokenize(str(state.get("message", "")))
+    message = str(state.get("message", ""))
+    lowered = message.lower()
+    explicit_compare_phrase = "compare" in lowered or " vs " in lowered or " versus " in lowered
+    return bool(tool_result.get("comparison_requested")) or _is_comparison_request(message, words) or explicit_compare_phrase
+
+
+def _has_markdown_table(text: str) -> bool:
+    return "|" in text and "|---" in text
+
+
+def _deterministic_grounded_fallback(*, state: AgentState, policy_context: list[dict[str, str]], product_snippets: list[dict[str, Any]], next_step_guidance: str) -> str:
+    user_message = str(state.get("message", "")).strip()
+    if product_snippets:
+        first_title = str(product_snippets[0].get("title") or "these options").strip()
+        return (
+            f"I found grounded options that match \"{user_message}\". "
+            f"Start with {first_title}, and I can narrow by budget, material, or purpose in the next step."
+        )
+
+    if policy_context:
+        first_topic = str(policy_context[0].get("title") or "policy guidance").strip()
+        return (
+            f"Based on available SATMI guidance, this maps to {first_topic}. "
+            "If you want, I can provide a concise checklist for what to do next."
+        )
+
+    return (
+        f"I can help with \"{user_message}\" right away. "
+        f"{next_step_guidance}"
+    )
+
+
+def _evidence_gap_response(*, state: AgentState, policy_missing: bool, products_missing: bool) -> str:
+    user_message = str(state.get("message", "")).strip()
+    if policy_missing and products_missing:
+        return (
+            f"I want to answer \"{user_message}\" accurately, but I do not have enough grounded policy or catalog context yet. "
+            "Could you share one specific detail: are you asking about policy terms or product recommendations?"
+        )
+    if policy_missing:
+        return (
+            f"I want to answer \"{user_message}\" accurately, but I do not have matching policy context yet. "
+            "Could you specify which policy you need: shipping, return, refund, or cancellation?"
+        )
+    if products_missing:
+        return (
+            f"I cannot find a grounded catalog match for \"{user_message}\" yet. "
+            "Please share your preferred category or budget, and I will narrow it precisely."
+        )
+    return (
+        f"I want to answer \"{user_message}\" accurately, but I need one more detail to ground the response. "
+        "Could you clarify your primary goal?"
+    )
+
+
+def _comparison_table_from_products(products: list[dict[str, Any]]) -> str:
+    rows = ["| Product | Price | Product Link |", "|---|---|---|"]
+    for item in products[:3]:
+        title = str(item.get("title", "Product")).replace("|", "/")
+        price = str(item.get("price", "NA")).replace("|", "/")
+        link = str(item.get("product_url") or "NA").replace("|", "/")
+        rows.append(f"| {title} | {price} | {link} |")
+    return "\n".join(rows)
+
+
+def _record_feedback_event(*, state: AgentState, reason: str, response_text: str) -> None:
+    try:
+        root = Path(__file__).resolve().parents[2]
+        out = root / "evaluations" / "response_feedback_log.jsonl"
+        payload = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "conversation_id": state.get("conversation_id"),
+            "user_id": state.get("user_id"),
+            "message": state.get("message"),
+            "intent": state.get("intent"),
+            "action": state.get("action"),
+            "reason": reason,
+            "response": response_text,
+        }
+        out.parent.mkdir(parents=True, exist_ok=True)
+        with out.open("a", encoding="utf-8") as fp:
+            fp.write(json.dumps(payload, ensure_ascii=True) + "\n")
+    except Exception:
+        pass
+
+
 def input_guardrails(state: AgentState) -> AgentState:
     message = state.get("message", "")
     issues = detect_guardrail_issues(message)
@@ -224,22 +602,38 @@ def classify_intent(state: AgentState) -> AgentState:
     message = state.get("message", "")
     words = _tokenize(message)
 
-    support_hits = len(words.intersection(SUPPORT_KEYWORDS))
-    shopping_hits = len(words.intersection(SHOPPING_KEYWORDS))
-    product_query = _looks_like_product_query(message, words)
-
-    intent = "unknown"
-    confidence = 0.4
-
-    if support_hits > 0 and shopping_hits > 0:
-        intent = "mixed"
-        confidence = 0.75
-    elif support_hits > 0:
-        intent = "support"
-        confidence = 0.80
-    elif shopping_hits > 0 or product_query:
+    if _parse_selected_product_intent(message):
         intent = "shopping"
-        confidence = 0.80 if shopping_hits > 0 else 0.72
+        confidence = 1.0
+        classification_source = "system_intent_select_product"
+    elif _is_brand_faq(message, words) or _is_policy_question(message, words):
+        intent = "policy_brand_faq"
+        confidence = 1.0
+        classification_source = "keyword_policy_faq"
+    elif _must_force_product_tool_usage(message, words):
+        intent = "shopping"
+        confidence = 1.0
+        classification_source = "forced_product_tool_usage"
+    elif _contains_authentication_intent(message):
+        intent = "authentication"
+        confidence = 1.0
+        classification_source = "keyword_authentication"
+    else:
+        llm_intent = classify_intent_with_llm(
+            user_message=message,
+            message_history=state.get("message_history", []),
+        )
+        if llm_intent is not None:
+            intent, confidence = llm_intent
+            classification_source = "llm"
+            if intent == "shopping" and not _is_store_related(message, words):
+                intent = "general"
+                confidence = min(confidence, 0.55)
+                classification_source = "llm_demoted_non_store_related"
+        else:
+            intent = "general"
+            confidence = 0.5
+            classification_source = "llm_unavailable_default"
 
     requested_human = _requested_human_assistance(message, words)
     out_of_scope = _is_legal_or_financial_dispute(message, words)
@@ -258,6 +652,7 @@ def classify_intent(state: AgentState) -> AgentState:
                 "event": "intent_classified",
                 "intent": intent,
                 "confidence": confidence,
+                "classification_source": classification_source,
                 "requested_human": requested_human,
                 "out_of_scope": out_of_scope,
                 "highly_frustrated": highly_frustrated,
@@ -267,17 +662,8 @@ def classify_intent(state: AgentState) -> AgentState:
 
 
 def policy_guard(state: AgentState) -> AgentState:
-    intent = state.get("intent", "unknown")
     confidence = state.get("confidence", 0.0)
-
-    # G6 fix: Allow "unknown" intents at the lower 0.4 confidence floor.
-    # The system prompt says: "use search_products even if only 40% sure."
-    if intent in {"support", "shopping", "mixed"}:
-        policy_ok = confidence >= 0.65
-    elif intent == "unknown":
-        policy_ok = confidence >= 0.4
-    else:
-        policy_ok = False
+    policy_ok = confidence >= 0.40
 
     if state.get("out_of_scope"):
         policy_ok = False
@@ -295,7 +681,20 @@ def policy_guard(state: AgentState) -> AgentState:
 
 
 def retrieve_policy_node(state: AgentState) -> AgentState:
-    context = retrieve_policy_context(state.get("message", ""), state.get("intent", "unknown"))
+    intent = state.get("intent", "unknown")
+    if intent in {"policy_brand_faq", "general"}:
+        return {
+            **state,
+            "policy_context": [],
+            "grounded": True,
+            "internal_logs": [
+                *_state_logs(state),
+                {"event": "policy_retrieval_bypassed", "intent": intent},
+            ],
+        }
+
+    retrieval_intent = "shopping" if intent == "general" else intent
+    context = retrieve_policy_context(state.get("message", ""), retrieval_intent)
     grounded = len(context) > 0
 
     return {
@@ -309,122 +708,180 @@ def retrieve_policy_node(state: AgentState) -> AgentState:
     }
 
 
-def execute_action(state: AgentState) -> AgentState:
-    message = state.get("message", "")
-    user_id = state.get("user_id", "unknown")
+def route_post_policy(state: AgentState) -> str:
+    return "execute_action"
+
+
+def route_after_policy_guard(state: AgentState) -> str:
+    message = str(state.get("message", ""))
     words = _tokenize(message)
-    requires_auth = settings.firebase_auth_enabled and settings.firebase_require_for_sensitive_actions
-    user_authenticated = bool(state.get("user_authenticated", False))
-    placing_order = "place" in words and "order" in words
-    comparison_request = _is_comparison_request(message, words)
-    tracking_order = any(keyword in words for keyword in {"track", "shipment", "delivery"}) or (
-        "order" in words and bool(words.intersection(ORDER_TRACKING_HINTS))
+    if not state.get("policy_ok", True):
+        return "handoff_to_human"
+    if _must_force_product_tool_usage(message, words):
+        return "retrieve_policy"
+    if state.get("intent") in {"policy_brand_faq", "general"}:
+        return "general_conversation"
+    return "retrieve_policy"
+
+
+def _fallback_general_conversation_response(message: str, policy_context: list[dict[str, str]]) -> str:
+    cleaned = str(message or "").strip()
+    if policy_context:
+        topic = str(policy_context[0].get("title") or "SATMI policy").strip()
+        detail = str(policy_context[0].get("content") or "").strip()
+        concise_detail = detail[:180] + ("..." if len(detail) > 180 else "")
+        if concise_detail:
+            return f"Here is what I can confirm right now about {topic}: {concise_detail}"
+        return f"Here is what I can confirm right now about {topic}. Tell me what specific detail you need next."
+
+    if cleaned:
+        return (
+            f"I am having a brief delay from the AI service, but I can still help with \"{cleaned}\". "
+            "Share whether you want policy guidance, order help, or product recommendations, and I will continue."
+        )
+
+    return TEMP_AI_CORE_ISSUE_MESSAGE
+
+
+def general_conversation(state: AgentState) -> AgentState:
+    user_message = state.get("message", "")
+    policy_context = state.get("policy_context", [])
+    history = _ensure_system_message_first(state.get("message_history", []))
+    llm_history = _ensure_system_message_first(
+        [{"role": "system", "content": SATMI_SYSTEM_PROMPT}, *history]
     )
 
-    action = "none"
-    tool_result: dict[str, Any] = {}
-    errors = state.get("errors", [])
-    logs = [*_state_logs(state)]
-
-    def _react(phase: str, thought: str, detail: dict[str, Any] | None = None) -> None:
-        payload = detail or {}
-        logs.append(
-            {
-                "event": "react",
-                "phase": phase,
-                "thought": thought,
-                "detail": payload,
-            }
-        )
-        react_logger.info("REACT phase=%s thought=%s detail=%s", phase, thought, payload)
-        print(f"[REACT] phase={phase} thought={thought} detail={payload}")
-
+    words = _tokenize(user_message)
+    history_text = [str(item.get("content", "")).strip() for item in history if str(item.get("content", "")).strip()]
     try:
-        if requires_auth and not user_authenticated and (placing_order or tracking_order or ("cancel" in words and "order" in words)):
-            action = "auth_required"
-            _react("think", "This is a sensitive order action and requires verified identity.")
-            tool_result = {
-                "required_for": "place_or_manage_order",
-                "auth_provider": "firebase",
-                "instruction": "Sign in and send Firebase ID token in Authorization: Bearer <token> or X-Firebase-Token header.",
+        recent_user_messages = persistence_service.list_recent_user_messages(state.get("user_id", "unknown"), limit=20)
+    except Exception:
+        recent_user_messages = []
+    user_preferences = _extract_user_preferences(messages=[*history_text, *recent_user_messages])
+    summary = _conversation_summary({**state, "message_history": history})
+    context_packet = {
+        "policy_snippets": policy_context,
+        "product_snippets": [],
+        "recent_conversation_summary": summary,
+        "user_state": {
+            "authenticated": bool(state.get("user_authenticated", False)),
+            "order_intent": bool(any(token in words for token in {"order", "buy", "checkout", "place"})),
+            "preferences": user_preferences,
+        },
+    }
+
+    response_source = "llm"
+    response = generate_general_conversation_response(
+        user_message=user_message,
+        message_history=llm_history,
+        policy_context=policy_context,
+    )
+
+    if not response:
+        response = _fallback_general_conversation_response(user_message, policy_context)
+        response_source = "deterministic_fallback"
+
+    return {
+        **state,
+        "action": "general_conversation",
+        "status": "active",
+        "response": response,
+        "response_text": response,
+        "recommended_products": [],
+        "tool_result": {},
+        "message_history": history,
+        "user_preferences": user_preferences,
+        "conversation_summary": summary,
+        "context_packet": context_packet,
+        "internal_logs": [
+            *_state_logs(state),
+            {
+                "event": "general_conversation",
+                "policy_snippet_count": len(policy_context),
+                "product_snippet_count": 0,
+                "history_turns": len(history),
+                "response_source": response_source,
+            },
+        ],
+    }
+
+
+def execute_action(state: AgentState) -> AgentState:
+    intent = str(state.get("intent", "")).strip().lower()
+    if intent in {"policy_brand_faq", "general"}:
+        return {
+            **state,
+            "action": "general_conversation",
+            "tool_result": {}
+        }
+
+    message = state.get("message", "")
+    user_id = state.get("user_id", "unknown")
+    intent = intent or "unknown"
+
+    # Strict routing by classified intent: only shopping can trigger product search.
+    if intent != "shopping":
+        if intent in {"policy_brand_faq", "general"}:
+            return {
+                **state,
+                "action": "general_conversation",
+                "tool_result": {},
+                "internal_logs": [*_state_logs(state), {"event": "action_bypassed_by_intent", "intent": intent}],
             }
-            _react("answer", "Prompting user to authenticate before action execution.")
-        elif "cancel" in words and "order" in words:
-            action = "cancel_redirect"
+
+        if intent == "order_tracking":
+            tool_result = tooling_service.get_customer_orders(user_id)
+            return {
+                **state,
+                "action": "get_customer_orders",
+                "tool_result": tool_result,
+                "internal_logs": [
+                    *_state_logs(state),
+                    {"event": "action_executed", "action": "get_customer_orders", "order_count": len(tool_result.get("orders", [])), "error_count": 0},
+                ],
+            }
+
+        # Cancellation requests go to portal.
+        words = _tokenize(message)
+        if "cancel" in words and "order" in words:
             order_id = _extract_order_reference(message)
-            _react("think", "Cancellation is policy-restricted and must be handled in accounts portal.", {"order_id": order_id})
-            _react("act", "Redirecting user to accounts portal for cancellation.")
             tool_result = {
                 "order_id": order_id,
-                "redirect_url": SATMI_ACCOUNTS_URL,
+                "redirect_url": "https://accounts.satmi.in",
                 "reason": "No-cancel policy in chatbot channel",
             }
-            _react("observe", "Generated cancellation redirect response.", tool_result)
-        elif placing_order:
-            quantity = _extract_quantity(message)
-            action = "place_order"
-            _react("think", "I need to place an order using the best product match.", {"quantity": quantity})
-            _react("act", "Calling place_order tool.")
-            tool_result = tooling_service.place_order(
-                product_query=message,
-                quantity=quantity,
-                user_id=user_id,
-                authenticated_user=state.get("authenticated_user"),
-            )
-            if tool_result.get("needs_input"):
-                action = "place_order_assist"
-            _react("observe", "Order placement tool completed.", {"placed": tool_result.get("placed")})
-        elif (
-            comparison_request
-            or any(keyword in words for keyword in {"recommend", "buy", "purchase", "product", "suggest", "shop", "browse", "list", "show", "find"})
-            or _looks_like_product_query(message, words)
-            or state.get("intent") == "unknown"
-        ):
-            # G3: Tag knowledge queries so compose_response can add educational context.
-            is_knowledge = _is_knowledge_query(message)
-            action = "knowledge_and_search" if is_knowledge else "search_products"
-            query = message
-            if comparison_request and len(words) <= 5:
-                history_hint = _comparison_history_hint(state)
-                if history_hint:
-                    query = f"{message} {history_hint}"
-            _react("think", "I should search product catalog context for this request.", {"knowledge_query": is_knowledge})
-            _react("act", "Calling search_products tool.")
-            tool_result = tooling_service.search_products(query)
-            tool_result["comparison_requested"] = comparison_request
-            tool_result["effective_query"] = query
-            tool_result["knowledge_query"] = is_knowledge
-            _react("observe", "Catalog search returned product candidates.", {"result_count": len(tool_result.get("results", []))})
-        elif tracking_order:
-            action = "get_customer_orders"
-            if state.get("order_context"):
-                _react("think", "Authenticated order context is already available in state; reuse it.")
-                tool_result = {
-                    "customer_id": user_id,
-                    "orders": state.get("order_context", []),
-                    "source": "firebase_context",
-                }
-            else:
-                _react("think", "I need latest order status for this user.")
-                _react("act", "Calling get_customer_orders tool.")
-                tool_result = tooling_service.get_customer_orders(user_id)
-            _react("observe", "Order status lookup completed.", {"order_count": len(tool_result.get("orders", []))})
-        else:
-            # G4: Instead of generic capabilities, ask a targeted clarification question.
-            action = "clarification"
-            _react("think", "Query is ambiguous; asking a targeted follow-up question instead of quitting.")
-    except Exception as exc:  # pragma: no cover
-        errors = [*errors, f"Tool execution failed: {exc}"]
-        _react("observe", "Tool execution raised an exception.", {"error": str(exc)})
+            return {
+                **state,
+                "action": "cancel_redirect",
+                "tool_result": tool_result,
+                "internal_logs": [
+                    *_state_logs(state),
+                    {"event": "action_executed", "action": "cancel_redirect", "order_id": order_id, "error_count": 0},
+                ],
+            }
 
+        # Ambiguous non-shopping intent — ask clarification.
+        return {
+            **state,
+            "action": "clarification",
+            "tool_result": {},
+            "internal_logs": [
+                *_state_logs(state),
+                {"event": "action_executed", "action": "clarification", "error_count": 0},
+            ],
+        }
+
+    action = "search_products"
+    clean_query = "Karungali Rudraksha Rose Quartz" if _is_best_sellers_query(message, _tokenize(message)) else _extract_search_query(message)
+    tool_result = tooling_service.search_products(clean_query)
+    tool_result["effective_query"] = clean_query
     return {
         **state,
         "action": action,
         "tool_result": tool_result,
-        "errors": errors,
         "internal_logs": [
-            *logs,
-            {"event": "action_executed", "action": action, "error_count": len(errors)},
+            *_state_logs(state),
+            {"event": "action_executed", "action": action, "query": clean_query, "error_count": 0},
         ],
     }
 
@@ -513,7 +970,15 @@ def handoff_to_human_node(state: AgentState) -> AgentState:
 
 def compose_response(state: AgentState) -> AgentState:
     action = state.get("action", "none")
+    intent = str(state.get("intent", "")).strip().lower() or "unknown"
+
+    if state.get("intent") != "shopping":
+        recommended_products = []
+        tool_result = {}
+        state = {**state, "tool_result": tool_result, "recommended_products": recommended_products}
+
     tool_result = state.get("tool_result", {})
+    auth_required = False
 
     def _format_price(value: Any, currency: str | None = None) -> str:
         code = (currency or settings.display_currency_code or "INR").upper()
@@ -525,212 +990,209 @@ def compose_response(state: AgentState) -> AgentState:
             return f"INR {amount:.2f}"
         return f"{code} {amount:.2f}"
 
-    def _with_next_step(text: str, next_step: str) -> str:
-        if "next step:" in text.lower():
-            return text
-        return f"{text}\n\nNext Step: {next_step}"
-
-    def _safe_cell(value: str) -> str:
-        return value.replace("|", "/").strip()
-
-    def _comparison_table(results: list[dict[str, Any]]) -> str:
-        rows = ["| Product | Price | Key Details |", "|---|---:|---|"]
-        for item in results[:3]:
-            name = f"**{_safe_cell(str(item.get('name', 'Unknown Product')))}**"
-            price = f"**{_safe_cell(_format_price(item.get('price'), item.get('currency')))}**"
-            details = _safe_cell(str(item.get("description", "")).strip()[:120] or "Catalog-matched product")
-            rows.append(f"| {name} | {price} | {details} |")
-        return "\n".join(rows)
-
-    def _display_product_name(name: str) -> str:
-        # Keep user-facing wording natural by avoiding catalog jargon labels.
-        cleaned = re.sub(r"\bcombo\b", "set", name, flags=re.IGNORECASE)
-        return " ".join(cleaned.split())
-
-    def _display_description(text: str, limit: int = 100) -> str:
-        cleaned = re.sub(r"\bcombo\b", "set", text, flags=re.IGNORECASE)
-        normalized = " ".join(cleaned.split())
-        if len(normalized) <= limit:
-            return normalized
-        short = normalized[:limit].rsplit(" ", 1)[0].strip()
-        return f"{short}..." if short else normalized[:limit]
-
-    def _product_bullets(results: list[dict[str, Any]], limit: int = 4) -> str:
-        lines: list[str] = []
-        for item in results[:limit]:
-            name = _display_product_name(str(item.get("name", "Product")))
-            price = _format_price(item.get("price"), item.get("currency"))
-            description = _display_description(str(item.get("description", "")), limit=100)
-            if description:
-                lines.append(f"- **{name}** - **{price}** ({description})")
-            else:
-                lines.append(f"- **{name}** - **{price}**")
-        return "\n".join(lines)
-
-    def _is_catalog_discovery_query(message: str) -> bool:
-        lowered = message.lower()
-        return (
-            "what products" in lowered
-            or "what do you offer" in lowered
-            or "show products" in lowered
-            or "show me products" in lowered
-            or "what can i buy" in lowered
-        )
-
-    if action == "cancel_redirect":
-        response = (
-            f"For your security, cancellation requests are handled only via {SATMI_ACCOUNTS_URL}. "
-            "Please sign in there to manage or cancel your order."
-        )
-        response = _with_next_step(response, "Open accounts.satmi.in, sign in, and cancel from your order details page.")
-    elif action == "place_order":
-        selected = tool_result.get("selected_product", {})
-        product_name = selected.get("name", "the selected product")
-        price_text = _format_price(tool_result.get("total_price") or selected.get("price"), tool_result.get("currency") or selected.get("currency"))
-        quantity = int(tool_result.get("quantity") or 1)
-        source = str(tool_result.get("source", "unknown"))
-        if tool_result.get("placed"):
-            draft_name = tool_result.get("draft_order_name") or tool_result.get("draft_order_id")
-            invoice_url = tool_result.get("invoice_url")
-            response = (
-                f"Your order request is created as draft order {draft_name} for {quantity} x {product_name} at {price_text}."
-            )
-            if invoice_url:
-                response = f"{response} Complete payment here: {invoice_url}"
-            if source == "shopify":
-                response = f"{response} This draft is created in your live Shopify store."
-        else:
-            response = (
-                f"I found {product_name} at {price_text}, but I could not create a live order yet. "
-                "Please confirm product variant, quantity, and delivery pincode to continue."
-            )
-            if tool_result.get("requires_live_store"):
-                response = f"{response} Live Shopify order placement is currently unavailable."
-        response = _with_next_step(response, "Reply with quantity and delivery pincode to continue.")
-    elif action == "get_customer_orders":
-        orders = tool_result.get("orders", [])
-        if not orders:
-            response = "I could not find any orders on your account yet."
-        else:
-            latest = orders[0]
-            response = (
-                f"Your latest order is {latest['order_id']} and its status is {latest['status']}. "
-                "Would you like help with tracking, cancellation, or reordering?"
-            )
-        response = _with_next_step(response, "Tell me if you want tracking details, re-order help, or cancellation steps.")
-    elif action in {"search_products", "knowledge_and_search"}:
-        results = tool_result.get("results", [])
-        comparison_requested = bool(tool_result.get("comparison_requested"))
-        is_knowledge = bool(tool_result.get("knowledge_query"))
-        user_message = str(state.get("message", ""))
-        discovery_query = _is_catalog_discovery_query(user_message)
-        if not results:
-            response = (
-                "I've got you covered. That's a unique request, and while we don't have that exact item right now, "
-                "I can suggest close alternatives based on your material and budget preference."
-            )
-            response = _with_next_step(response, "Tell me your preferred material and budget in INR, and I will suggest the best options.")
-        elif comparison_requested:
-            if len(results) < 2:
-                top = results[0]
-                response = (
-                    f"Great choice. I found one strong match: **{_display_product_name(top.get('name', 'Product'))}** at **{_format_price(top.get('price'), top.get('currency'))}**. "
-                    "Share one more option and I'll compare them clearly for you."
-                )
-                response = _with_next_step(response, "Share one more product name or use-case to compare side-by-side.")
-            else:
-                table = _comparison_table(results)
-                response = f"I'd be happy to help you compare. Here is a clean side-by-side view:\n\n{table}"
-                response = _with_next_step(response, "Tell me which product you want, and I can help you place the order.")
-        elif discovery_query:
-            curated = _product_bullets(results, limit=4)
-            response = (
-                "I'd be happy to show you what we have. Here are some popular picks from our collection:\n\n"
-                f"{curated}"
-            )
-            response = _with_next_step(response, "Which one catches your eye, or should I narrow this by budget and purpose?")
-        else:
-            top = results[0]
-            description = _display_description(str(top.get("description", "")), limit=180)
-            # G3: For knowledge queries, prepend a hint so LLM adds educational context.
-            if is_knowledge:
-                response = (
-                    f"Great question. **{_display_product_name(top['name'])}** is available for **{_format_price(top.get('price'), top.get('currency'))}**. "
-                    f"{description} "
-                    "Use your internal knowledge to provide a brief educational explanation of this item, "
-                    "then present the catalog details."
-                )
-            else:
-                response = f"Great choice. **{_display_product_name(top['name'])}** is available for **{_format_price(top.get('price'), top.get('currency'))}**."
-                if description:
-                    response = f"{response} {description}"
-            if len(results) > 2:
-                response = f"{response}\n\nHere are a few more options you might like:\n{_product_bullets(results[1:5], limit=4)}"
-            elif len(results) == 2:
-                second = results[1]
-                response = (
-                    f"{response} You may also like **{_display_product_name(second.get('name', 'Product'))}** "
-                    f"at **{_format_price(second.get('price'), second.get('currency'))}**."
-                )
-            response = f"{response} I can also help you compare options based on your purpose and budget."
-            response = _with_next_step(response, "Would you like a side-by-side comparison or should I help place an order?")
-    elif action == "place_order_assist":
-        results = tool_result.get("results", [])
-        source = str(tool_result.get("source", "unknown"))
-        if not results:
-            response = "I could not find a close match to place an order right now. Tell me the product name, material, and your budget in INR."
-        else:
-            top = results[0]
-            response = (
-                f"Great choice. I found {top.get('name')} at {_format_price(top.get('price'), top.get('currency'))}. "
-                "To place the order, confirm quantity and delivery pincode."
-            )
-            if source == "shopify":
-                response = f"{response} This offer is pulled from your live Shopify catalog."
-            elif source.startswith("stub"):
-                response = f"{response} Note: Shopify is currently unavailable, so this quote is from fallback data."
-        response = _with_next_step(response, "Reply with quantity and delivery pincode to proceed.")
-    elif action == "auth_required":
-        response = (
-            "Before I place, cancel, or fetch order details, please sign in. "
-            "Send Firebase ID token using Authorization: Bearer <token> or X-Firebase-Token header."
-        )
-        response = _with_next_step(response, "Sign in and send your Firebase token, then repeat your request.")
-    elif action == "clarification":
-        # G4: Targeted clarification instead of generic capabilities message.
-        user_message = state.get("message", "")
-        response = (
-            f"I want to help you with \"{user_message}\" but I need a bit more context. "
-            "Could you tell me if you are looking for a product recommendation, want to track an order, "
-            "or have a specific question about our catalog?"
-        )
-        response = _with_next_step(response, "Try asking something like: 'Show me Karungali malas' or 'Track my order #1001'.")
-    else:
-        response = (
-            "I can help with order tracking, order cancellation, and shopping recommendations. "
-            "Please share what you want to do."
-        )
-        response = _with_next_step(response, "Ask for a product recommendation, comparison, or order support action.")
-
     policy_context = state.get("policy_context", [])
-    if policy_context and action not in {"auth_required", "place_order_assist"}:
-        primary = policy_context[0]
-        response = f"{response} Quick note: {primary['content']}"
 
-    response = refine_response_with_llm(
-        user_message=state.get("message", ""),
-        base_response=response,
-        policy_context=policy_context,
-    )
+    recommended_products: list[dict[str, Any]] = []
+    intent = str(state.get("intent", "")).strip().lower()
+
+    if intent == "shopping" and action in {"search_products", "knowledge_and_search"}:
+        for item in (tool_result.get("results") or [])[:8]:
+            title = str(item.get("title") or item.get("name") or "").strip()
+            price_value = item.get("price")
+            if not title:
+                continue
+
+            raw_img = item.get("image_url") or item.get("image")
+            if isinstance(raw_img, dict):
+                img_str = str(raw_img.get("src") or raw_img.get("url") or "")
+            else:
+                img_str = str(raw_img or "")
+            if img_str.startswith("{") or not img_str:
+                img_str = "https://placehold.co/640x400/F9F6F2/7A1E1E?text=SATMI"
+
+            recommended_products.append(
+                {
+                    "product_id": str(item.get("product_id") or "") or None,
+                    "variant_id": str(item.get("variant_id") or "") or None,
+                    "handle": str(item.get("handle") or "") or None,
+                    "url": str(item.get("url") or item.get("product_url") or "") or None,
+                    "title": title,
+                    "price": _format_price(price_value, item.get("currency")),
+                    "image_url": img_str,
+                    "product_url": item.get("product_url"),
+                }
+            )
+
+    if not recommended_products and intent == "shopping":
+        try:
+            fallback_query = _extract_search_query(str(state.get("message", "")))
+            if not fallback_query or fallback_query == "product":
+                fallback_query = DEFAULT_DISCOVERY_QUERY
+            fallback_result = tooling_service.search_products(fallback_query)
+            for item in (fallback_result.get("results") or [])[:8]:
+                title = str(item.get("title") or item.get("name") or "").strip()
+                if not title:
+                    continue
+                recommended_products.append(
+                    {
+                        "product_id": str(item.get("product_id") or item.get("id") or "") or None,
+                        "variant_id": str(item.get("variant_id") or "") or None,
+                        "handle": str(item.get("handle") or "") or None,
+                        "url": str(item.get("url") or item.get("product_url") or "") or None,
+                        "title": title,
+                        "price": _format_price(item.get("price"), item.get("currency")),
+                        "image_url": (
+                            item.get("image_url").get("src")
+                            if isinstance(item.get("image_url"), dict)
+                            else str(item.get("image_url") or item.get("image") or "https://placehold.co/640x400/F9F6F2/7A1E1E?text=SATMI")
+                        ),
+                        "product_url": item.get("product_url") or item.get("url"),
+                    }
+                )
+            if fallback_result:
+                tool_result = fallback_result
+        except Exception:
+            pass
+
+    # Strict wipe: only shopping intent gets product cards.
+    if intent != "shopping":
+        recommended_products = []
+
+    history_text = [str(item.get("content", "")).strip() for item in state.get("message_history", []) if str(item.get("content", "")).strip()]
+    try:
+        recent_user_messages = persistence_service.list_recent_user_messages(state.get("user_id", "unknown"), limit=20)
+    except Exception:
+        recent_user_messages = []
+    user_preferences = _extract_user_preferences(messages=[*history_text, *recent_user_messages])
+    summary = _conversation_summary(state)
+    product_snippets = _build_product_snippets(tool_result)
+
+    context_packet = {
+        "policy_snippets": policy_context,
+        "product_snippets": product_snippets,
+        "recent_conversation_summary": summary,
+        "user_state": {
+            "authenticated": bool(state.get("user_authenticated", False)),
+            "order_intent": action in {"place_order", "place_order_assist"},
+            "preferences": user_preferences,
+        },
+    }
+
+    next_step_guidance_map = {
+        "cancel_redirect": "Ask the customer to sign in at accounts.satmi.in and manage cancellation from order details.",
+        "place_order": "Confirm quantity and delivery pincode, then guide payment completion if invoice URL exists.",
+        "get_customer_orders": "Offer tracking, cancellation guidance, or reorder assistance for the latest order.",
+        "search_products": "Offer shortlist refinement by intent, budget, or comparison preference.",
+        "knowledge_and_search": "Blend brief educational context with catalog-backed product guidance.",
+        "place_order_assist": "Ask for missing quantity or delivery details required to place order.",
+        "clarification": "Ask one focused follow-up question to clarify the user objective.",
+    }
+    next_step_guidance = next_step_guidance_map.get(action, "Offer the most relevant next help option for the user.")
+
+    compact_tool_result = {
+        "source": tool_result.get("source"),
+        "error": tool_result.get("error"),
+        "placed": tool_result.get("placed"),
+        "draft_order_id": tool_result.get("draft_order_id"),
+        "draft_order_name": tool_result.get("draft_order_name"),
+        "invoice_url": tool_result.get("invoice_url"),
+        "orders": (tool_result.get("orders") or [])[:3],
+        "comparison_requested": tool_result.get("comparison_requested"),
+        "result_count": len(tool_result.get("results") or []),
+        "results": product_snippets,
+    }
+
+    response_source = "llm"
+    if auth_required:
+        selected_name = str(
+            tool_result.get("selected_product_name")
+            or state.get("selected_product_name")
+            or ""
+        ).strip()
+        if selected_name:
+            response = (
+                f"Perfect choice. Here are some excellent options including {selected_name}. "
+                "Click the Select & Buy button on any product to proceed to our website for checkout."
+            )
+        else:
+            response = "Here are some excellent choices. Click the Select & Buy button on any product to proceed to our website for checkout."
+        response_source = "auth_intercept"
+    elif str(tool_result.get("error", "")).strip().lower() == "catalog unavailable":
+        response = (
+            "I am having trouble loading the live catalog right now. "
+            "Please share the product type you want (for example Karungali mala, Rudraksha bracelet, or crystal), "
+            "and I will refine recommendations and show available choices with Select & Buy links."
+        )
+        response_source = "catalog_unavailable"
+    else:
+        response = compose_structured_response_with_llm(
+            user_message=str(state.get("message", "")),
+            intent=str(intent),
+            action=str(action),
+            policy_context=policy_context,
+            tool_result=compact_tool_result,
+            recommended_products=recommended_products,
+            next_step_guidance=next_step_guidance,
+            retry_count=max(0, settings.gemini_retry_count),
+            message_history=state.get("message_history", []),
+        )
+
+    comparison_required = _comparison_requested(state, tool_result) and len(recommended_products) >= 2
+    if response and comparison_required and not _has_markdown_table(response):
+        if recommended_products:
+            response = (
+                "Here is a grounded comparison from the current SATMI catalog context:\n\n"
+                f"{_comparison_table_from_products(recommended_products)}"
+            )
+            response_source = "comparison_enforcer"
+        _record_feedback_event(state=state, reason="comparison_missing_table", response_text=response or "")
+
+    if not response:
+        response = _deterministic_grounded_fallback(
+            state=state,
+            policy_context=policy_context,
+            product_snippets=product_snippets,
+            next_step_guidance=next_step_guidance,
+        )
+        response_source = "deterministic_fallback"
+        _record_feedback_event(state=state, reason="llm_compose_fallback_used", response_text=response)
+
+    if comparison_required and not _has_markdown_table(response) and recommended_products:
+        response = (
+            "Here is a grounded comparison from the current SATMI catalog context:\n\n"
+            f"{_comparison_table_from_products(recommended_products)}"
+        )
+        response_source = "comparison_enforcer"
+        _record_feedback_event(state=state, reason="comparison_table_enforced_post_fallback", response_text=response)
+
+    # THE ABSOLUTE KILL SWITCH: Wipe cards for non-shopping intents
+    final_intent = str(state.get("intent", "")).strip().lower()
+    if final_intent not in ["shopping", "order_tracking"]:
+        recommended_products = []
 
     return {
         **state,
         "status": "active",
         "response": response,
+        "response_text": response,
+        "recommended_products": recommended_products,
+        "auth_required": auth_required,
+        "context_packet": context_packet,
+        "conversation_summary": summary,
+        "user_preferences": user_preferences,
         "async_task_id": tool_result.get("task_id"),
         "async_task_status": tool_result.get("status"),
         "internal_logs": [
             *_state_logs(state),
-            {"event": "response_composed", "status": "active"},
+            {
+                "event": "response_composed",
+                "status": "active",
+                "policy_snippet_count": len(policy_context),
+                "product_snippet_count": len(product_snippets),
+                "has_summary": bool(summary),
+                "has_preferences": bool(user_preferences),
+                "response_source": response_source,
+                "retrieval_source": tool_result.get("source"),
+            },
         ],
     }

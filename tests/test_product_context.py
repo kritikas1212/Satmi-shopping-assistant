@@ -29,6 +29,7 @@ def test_product_search_response_inr_format(monkeypatch, client):
     def fake_search_products(query: str):
         return {
             "query": query,
+            "comparison_requested": False,
             "results": [
                 {
                     "product_id": "P-9999",
@@ -58,16 +59,20 @@ def test_product_search_response_inr_format(monkeypatch, client):
     data = response.json()
 
     # Response should contain INR formatting and a clear next step.
-    assert "INR 29.99" in data["response"]
-    assert "next step:" in data["response"].lower()
-    assert "local catalog cache" not in data["response"].lower()
-    assert "catalog items" not in data["response"].lower()
+    assert data["response_text"]
+    assert data["recommended_products"]
+    assert data["recommended_products"][0]["price"] == "INR 29.99"
+    assert "next step:" not in data["response_text"].lower()
+    assert "you can continue by" not in data["response_text"].lower()
+    assert "local catalog cache" not in data["response_text"].lower()
+    assert "catalog items" not in data["response_text"].lower()
 
 
 def test_product_search_stub_fallback_source_is_graceful(monkeypatch, client):
     def fake_search_products(query: str):
         return {
             "query": query,
+            "comparison_requested": False,
             "results": [
                 {
                     "product_id": "P-1001",
@@ -94,7 +99,54 @@ def test_product_search_stub_fallback_source_is_graceful(monkeypatch, client):
     response = client.post("/chat", json=payload, headers=_auth_headers())
     assert response.status_code == 200
     data = response.json()
-    assert "INR 29.99" in data["response"]
-    assert "next step:" in data["response"].lower()
-    assert "local catalog cache" not in data["response"].lower()
-    assert "catalog items" not in data["response"].lower()
+    assert data["response_text"]
+    assert data["recommended_products"]
+    assert data["recommended_products"][0]["price"] == "INR 29.99"
+    assert "next step:" not in data["response_text"].lower()
+    assert "you can continue by" not in data["response_text"].lower()
+    assert "local catalog cache" not in data["response_text"].lower()
+    assert "catalog items" not in data["response_text"].lower()
+
+
+def test_policy_question_returns_no_recommended_products(monkeypatch, client):
+    def fail_search_products(query: str):
+        raise AssertionError(f"search_products should not be called for policy questions: {query}")
+
+    monkeypatch.setattr(tooling_service, "search_products", fail_search_products)
+
+    payload = {
+        "user_id": "test_user_policy",
+        "conversation_id": "test_conv_policy",
+        "message": "What is your return policy?",
+    }
+
+    response = client.post("/chat", json=payload, headers=_auth_headers())
+    assert response.status_code == 200
+    data = response.json()
+
+    assert data["recommended_products"] == []
+    assert data["metadata"]["recommendation_count"] == 0
+    assert data["response_text"].strip()
+    assert "policy" in data["response_text"].lower()
+
+
+def test_policy_question_with_show_me_phrase_returns_no_recommended_products(monkeypatch, client):
+    def fail_search_products(query: str):
+        raise AssertionError(f"search_products should not be called for policy questions: {query}")
+
+    monkeypatch.setattr(tooling_service, "search_products", fail_search_products)
+
+    payload = {
+        "user_id": "test_user_policy_show_me",
+        "conversation_id": "test_conv_policy_show_me",
+        "message": "Show me your return policy",
+    }
+
+    response = client.post("/chat", json=payload, headers=_auth_headers())
+    assert response.status_code == 200
+    data = response.json()
+
+    assert data["recommended_products"] == []
+    assert data["metadata"]["recommendation_count"] == 0
+    assert data["response_text"].strip()
+    assert "policy" in data["response_text"].lower()

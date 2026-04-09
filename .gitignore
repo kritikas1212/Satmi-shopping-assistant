@@ -7,3 +7,5 @@ satmi_agent.db
 .DS_Store
 .logs/
 *-firebase-adminsdk-*.json
+*.log
+node_modules/
