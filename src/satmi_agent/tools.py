@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import logging
 import re
 import time
 from typing import Any
@@ -13,6 +14,10 @@ from satmi_agent.observability import record_shopify_error
 from satmi_agent.persistence import persistence_service
 from satmi_agent.schemas import HandoffTicket
 from satmi_agent.tracing import get_tracer
+
+
+DEFAULT_PRODUCT_IMAGE_URL = "https://placehold.co/640x400/F9F6F2/7A1E1E?text=SATMI"
+logger = logging.getLogger("satmi_agent.tools")
 
 
 class ToolingService:
@@ -47,6 +52,11 @@ class ToolingService:
             raise RuntimeError("Shopify store domain is not configured.")
         safe_path = path if path.startswith("/") else f"/{path}"
         return f"https://{self._admin_store_domain}/admin/api/{self._api_version}{safe_path}"
+
+    def _draft_orders_endpoint_url(self) -> str:
+        if not self._admin_store_domain:
+            raise RuntimeError("Shopify store domain is not configured.")
+        return f"https://{self._admin_store_domain}/admin/api/2024-01/draft_orders.json"
 
     def _request(self, method: str, path: str, *, params: dict[str, Any] | None = None, json: dict[str, Any] | None = None) -> dict[str, Any]:
         url = self._shopify_url(path)
@@ -106,6 +116,41 @@ class ToolingService:
             raise RuntimeError("Order reference must contain digits (example: #1001).")
         return digits
 
+    def _strip_product_gid(self, product_id: str) -> str:
+        raw = str(product_id or "").strip()
+        if not raw:
+            return ""
+        # Handles gid://shopify/Product/1234567890 and plain numeric ids.
+        if raw.startswith("gid://shopify/Product/"):
+            raw = raw.rsplit("/", 1)[-1]
+        match = re.search(r"(\d+)", raw)
+        return match.group(1) if match else raw
+
+    def _resolve_checkout_variant_and_title(self, product_id: str) -> tuple[str, str]:
+        cleaned_id = str(product_id or "").strip()
+        if not cleaned_id:
+            raise RuntimeError("product_id is required for checkout.")
+
+        products = persistence_service.list_product_catalog(limit=settings.catalog_cache_max_products)
+        for product in products:
+            current_product_id = str(product.get("id") or "").strip()
+            product_title = str(product.get("title") or cleaned_id).strip() or cleaned_id
+            variants = product.get("variants") if isinstance(product.get("variants"), list) else []
+
+            if current_product_id and current_product_id == cleaned_id:
+                for variant in variants:
+                    variant_id = str((variant or {}).get("id") or "").strip()
+                    if variant_id:
+                        return variant_id, product_title
+                return cleaned_id, product_title
+
+            for variant in variants:
+                variant_id = str((variant or {}).get("id") or "").strip()
+                if variant_id and variant_id == cleaned_id:
+                    return variant_id, product_title
+
+        return cleaned_id, cleaned_id
+
     def _find_order_by_reference(self, order_reference: str) -> dict[str, Any]:
         order_number = self._extract_order_number(order_reference)
         response = self._request("GET", "/orders.json", params={"status": "any", "limit": 50})
@@ -131,6 +176,12 @@ class ToolingService:
         except Exception:
             return settings.display_currency_code
 
+    def _storefront_domain(self) -> str:
+        domain = (self._public_store_domain or settings.shopify_store_domain or "uismgu-m5.myshopify.com").strip()
+        if domain.startswith("http://") or domain.startswith("https://"):
+            domain = domain.split("://", 1)[1]
+        return domain.strip("/")
+
     def _query_tokens(self, query: str) -> list[str]:
         stop_words = {
             "what",
@@ -152,6 +203,33 @@ class ToolingService:
         }
         tokens = re.findall(r"[a-zA-Z0-9']+", query.lower())
         return [token for token in tokens if token not in stop_words and len(token) > 1]
+
+    def _extract_material_hints(self, query: str) -> set[str]:
+        known_materials = {
+            "rudraksha",
+            "karungali",
+            "crystal",
+            "rose",
+            "quartz",
+            "tulsi",
+            "sandal",
+            "silver",
+        }
+        tokens = set(self._query_tokens(query))
+        hints: set[str] = set()
+        if "rose" in tokens and "quartz" in tokens:
+            hints.add("rose quartz")
+        hints.update(token for token in tokens if token in known_materials)
+        return hints
+
+    def _matches_material_hints(self, product: dict[str, Any], hints: set[str]) -> bool:
+        if not hints:
+            return True
+        searchable = self._searchable_product_text(product)
+        for hint in hints:
+            if hint in searchable:
+                return True
+        return False
 
     def _searchable_product_text(self, product: dict[str, Any]) -> str:
         title = str(product.get("title", ""))
@@ -198,11 +276,64 @@ class ToolingService:
         except Exception:
             return False
 
-    def _normalize_variant(self, variant: dict[str, Any], fallback_id: Any) -> dict[str, Any]:
+    def _extract_product_image_url(self, product: dict[str, Any]) -> str:
+        image_url = ""
+
+        # --- Robust fallback chain with explicit dict handling ---
+        # 1. REST: product.image.src
+        if product.get("image") and isinstance(product["image"], dict) and product["image"].get("src"):
+            image_url = str(product["image"]["src"] or "").strip()
+        # 2. REST: product.images[0].src
+        elif product.get("images") and isinstance(product.get("images"), list) and len(product["images"]) > 0:
+            first_img = product["images"][0]
+            if isinstance(first_img, dict) and first_img.get("src"):
+                image_url = str(first_img["src"] or "").strip()
+        # 3. GraphQL: product.featuredImage.url
+        elif product.get("featuredImage") and isinstance(product.get("featuredImage"), dict) and product["featuredImage"].get("url"):
+            image_url = str(product["featuredImage"]["url"] or "").strip()
+        # 4. GraphQL edges: product.images.edges[0].node.url
+        elif product.get("images") and isinstance(product.get("images"), dict):
+            image_edges = product.get("images", {}).get("edges") or []
+            if image_edges and isinstance(image_edges[0], dict):
+                image_url = str(image_edges[0].get("node", {}).get("url", "") or "").strip()
+
+        # 5. Backward-compat flat key — must also handle dict objects.
+        if not image_url:
+            raw = product.get("image_url") or ""
+            if isinstance(raw, dict):
+                image_url = str(raw.get("src") or raw.get("url") or "").strip()
+            else:
+                image_url = str(raw).strip()
+
+        # STRICT GUARD: if the final string starts with { it is a stringified dict.
+        if image_url.startswith("{"):
+            image_url = DEFAULT_PRODUCT_IMAGE_URL
+
+        return image_url or DEFAULT_PRODUCT_IMAGE_URL
+
+    def _extract_variant_id(self, product: dict[str, Any]) -> str | None:
+        """Extract numeric variant_id from the FIRST item in the variants array.
+
+        GoKwik requires the VARIANT id (not product id) for cart permalinks.
+        """
+        variants = product.get("variants")
+        if not isinstance(variants, list) or len(variants) == 0:
+            return None
+        first = variants[0]
+        if not isinstance(first, dict):
+            return None
+        vid = first.get("id")
+        if vid is None:
+            return None
+        # Ensure we return a clean string representation of the numeric id.
+        return str(vid).strip() or None
+
+    def _normalize_variant(self, variant: dict[str, Any], fallback_id: Any, image_url: str | None = None) -> dict[str, Any]:
         return {
             "id": variant.get("id"),
             "sku": variant.get("sku") or str(fallback_id),
             "price": variant.get("price") or 0.0,
+            "image_url": image_url,
         }
 
     def _rank_products(self, *, query: str, products: list[dict[str, Any]], currency: str) -> tuple[list[dict[str, Any]], int]:
@@ -220,13 +351,29 @@ class ToolingService:
         for score, product in scored[: settings.catalog_search_result_limit]:
             variants = product.get("variants") or []
             first_variant = variants[0] if variants else {}
+            title = str(product.get("title") or product.get("name") or "Unknown Product")
+            handle = str(product.get("handle") or "").strip()
+            if not handle and title:
+                handle = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
+            image_url = self._extract_product_image_url(product)
+            if image_url == DEFAULT_PRODUCT_IMAGE_URL and isinstance(first_variant, dict):
+                variant_image_url = str(first_variant.get("image_url") or "").strip()
+                if variant_image_url:
+                    image_url = variant_image_url
+            storefront_domain = self._storefront_domain()
+            product_url = f"https://{storefront_domain}/products/{handle}" if storefront_domain and handle else None
             body_no_html = re.sub(r"<[^>]+>", " ", str(product.get("body_html", ""))).strip()
             results.append(
                 {
                     "product_id": product.get("id"),
                     "variant_id": first_variant.get("id"),
+                    "handle": handle or None,
+                    "url": product_url,
+                    "product_url": product_url,
+                    "image_url": image_url,
+                    "title": title,
                     "sku": first_variant.get("sku") or str(product.get("id")),
-                    "name": product.get("title", "Unknown Product"),
+                    "name": title,
                     "price": float(first_variant.get("price") or 0.0),
                     "currency": currency,
                     "description": " ".join(body_no_html.split())[:240],
@@ -265,20 +412,49 @@ class ToolingService:
 
         return products
 
+    def _fetch_public_storefront_products(self) -> list[dict[str, Any]]:
+        """Fetch products from public storefront JSON endpoint when Admin API is unavailable."""
+        candidate_domains = []
+        primary = self._storefront_domain()
+        if primary:
+            candidate_domains.append(primary)
+        # Known SATMI storefront fallback.
+        if "uismgu-m5.myshopify.com" not in candidate_domains:
+            candidate_domains.append("uismgu-m5.myshopify.com")
+
+        for domain in candidate_domains:
+            url = f"https://{domain}/products.json"
+            try:
+                with httpx.Client(timeout=settings.shopify_timeout_seconds) as client:
+                    response = client.get(url, params={"limit": 250})
+                if response.status_code != 200:
+                    continue
+                body = response.json()
+                products = body.get("products")
+                if isinstance(products, list) and products:
+                    return products
+            except Exception:
+                continue
+
+        return []
+
     def _cache_ready_shopify_products(self, products: list[dict[str, Any]]) -> list[dict[str, Any]]:
         cache_rows: list[dict[str, Any]] = []
         for product in products:
             variants = product.get("variants") or []
-            normalized_variants = [self._normalize_variant(variant, product.get("id")) for variant in variants]
+            image_url = self._extract_product_image_url(product)
+            normalized_variants = [self._normalize_variant(variant, product.get("id"), image_url=image_url) for variant in variants]
             cache_rows.append(
                 {
                     "id": product.get("id"),
                     "title": product.get("title", "Unknown Product"),
+                    "handle": product.get("handle"),
                     "body_html": product.get("body_html", ""),
                     "product_type": product.get("product_type", ""),
                     "tags": product.get("tags", ""),
                     "vendor": product.get("vendor", ""),
                     "status": product.get("status", "active"),
+                    "image_url": image_url,
                     "variants": normalized_variants,
                     "searchable_text": self._searchable_product_text(product),
                     "updated_at": product.get("updated_at"),
@@ -339,103 +515,181 @@ class ToolingService:
         }
 
     def search_products(self, query: str) -> dict:
+        """Search the catalog and return up to the configured result limit without synthetic padding."""
         currency = self._shop_currency()
+        source = "shopify_top8"
+        clean_query = " ".join((query or "").split()).strip()
+        query_tokens = self._query_tokens(clean_query)
+        material_hints = self._extract_material_hints(clean_query)
+        generic_discovery = len(query_tokens) == 0 or clean_query.lower() in {
+            "product",
+            "products",
+            "satmi",
+            "best seller",
+            "best sellers",
+        }
 
-        if settings.catalog_cache_enabled:
+        # --- Fetch products from best available source ---
+        products: list[dict[str, Any]] = []
+        try:
+            products = self._fetch_all_shopify_products() if self.shopify_enabled else self._fetch_public_storefront_products()
+        except Exception:
+            products = []
+
+        if not products:
             try:
-                snapshot = persistence_service.get_catalog_cache_snapshot()
-                has_cache = int(snapshot.get("product_count") or 0) > 0
-                fresh_cache = self._cache_snapshot_fresh(snapshot.get("latest_sync_at"))
-
-                if has_cache and fresh_cache:
-                    cached_products = persistence_service.list_product_catalog(limit=settings.catalog_cache_max_products)
-                    results, matched_count = self._rank_products(query=query, products=cached_products, currency=currency)
-                    return {
-                        "query": query,
-                        "results": results,
-                        "source": "db_cache",
-                        "catalog_size": len(cached_products),
-                        "matched_count": matched_count,
-                    }
+                products = self._fetch_public_storefront_products()
+                source = "storefront_top8"
             except Exception:
-                # Continue with live fetch if cache read fails.
-                pass
+                products = []
 
-        if self.shopify_enabled:
+        if not products:
             try:
-                products = self._fetch_all_shopify_products()
-                if settings.catalog_cache_enabled and products:
-                    persistence_service.upsert_product_catalog(self._cache_ready_shopify_products(products))
+                products = persistence_service.list_product_catalog(limit=max(8, settings.catalog_search_result_limit))
+                if products:
+                    source = "catalog_cache"
+            except Exception:
+                products = []
 
-                results, matched_count = self._rank_products(query=query, products=products, currency=currency)
-                return {
-                    "query": query,
-                    "results": results,
-                    "source": "shopify_live_sync",
-                    "catalog_size": len(products),
-                    "matched_count": matched_count,
+        if not products:
+            return {
+                "query": query,
+                "results": [],
+                "source": "catalog_unavailable",
+                "error": "Catalog unavailable",
+                "catalog_size": 0,
+                "matched_count": 0,
+            }
+
+        # --- Material hard-filter ---
+        candidate_products = products
+        if material_hints:
+            filtered_by_material = [item for item in products if self._matches_material_hints(item, material_hints)]
+            candidate_products = filtered_by_material
+            source = f"{source}_material_filtered"
+
+        # --- Rank & score ---
+        ranked_results, matched_count = self._rank_products(query=clean_query or query, products=candidate_products, currency=currency)
+
+        # --- Build final list from actual catalog matches only ---
+        normalized_results: list[dict[str, Any]] = []
+        storefront_domain = self._storefront_domain()
+
+        source_products = ranked_results if ranked_results else candidate_products[: settings.catalog_search_result_limit]
+
+        for item in source_products[: settings.catalog_search_result_limit]:
+            # Title
+            title = str(item.get("title") or item.get("name") or "SATMI Product").strip() or "SATMI Product"
+
+            # Handle
+            handle = str(item.get("handle") or "").strip()
+            if not handle and title:
+                handle = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
+
+            # Variant ID — CRITICAL for GoKwik cart permalinks
+            variant_id: str | None = None
+            if "variant_id" in item and item["variant_id"] is not None:
+                variant_id = str(item["variant_id"]).strip() or None
+            if not variant_id:
+                variant_id = self._extract_variant_id(item)
+
+            # Price
+            price_raw = item.get("price")
+            if price_raw is None:
+                variants = item.get("variants")
+                if isinstance(variants, list) and len(variants) > 0:
+                    fv = variants[0]
+                    if isinstance(fv, dict):
+                        price_raw = fv.get("price")
+            try:
+                numeric_price = float(price_raw or 0.0)
+            except (TypeError, ValueError):
+                numeric_price = 0.0
+
+            # Image — robust chain with dict-safety guard
+            raw_image = item.get("image_url") or item.get("image") or ""
+            # If Shopify sent a dict object instead of a URL string, extract the key.
+            if isinstance(raw_image, dict):
+                image_url = str(raw_image.get("src") or raw_image.get("url") or "").strip()
+            else:
+                image_url = str(raw_image).strip()
+            if not image_url or image_url == DEFAULT_PRODUCT_IMAGE_URL:
+                image_url = self._extract_product_image_url(item)
+            if isinstance(image_url, str) and image_url.startswith("//"):
+                image_url = f"https:{image_url}"
+            # Final guard: never let a stringified dict leak through.
+            if image_url.startswith("{"):
+                image_url = DEFAULT_PRODUCT_IMAGE_URL
+
+            # URLs
+            product_url = f"https://{storefront_domain}/products/{handle}" if storefront_domain and handle else None
+            cart_url = None
+            if variant_id and storefront_domain:
+                cart_url = f"https://{storefront_domain}/cart/{variant_id}:1"
+
+            normalized_results.append(
+                {
+                    "id": str(item.get("product_id") or item.get("id") or ""),
+                    "product_id": str(item.get("product_id") or item.get("id") or ""),
+                    "variant_id": variant_id,
+                    "title": title,
+                    "price": numeric_price,
+                    "currency": str(item.get("currency") or currency),
+                    "handle": handle or None,
+                    "image": image_url or DEFAULT_PRODUCT_IMAGE_URL,
+                    "image_url": image_url or DEFAULT_PRODUCT_IMAGE_URL,
+                    "product_url": product_url,
+                    "url": product_url,
+                    "cart_url": cart_url,
+                    "relevance": item.get("relevance"),
                 }
-            except Exception:
-                # Fall back to stale cache or local stub matching so product queries still resolve.
-                if settings.catalog_cache_enabled:
-                    try:
-                        stale_cache = persistence_service.list_product_catalog(limit=settings.catalog_cache_max_products)
-                        if stale_cache:
-                            results, matched_count = self._rank_products(query=query, products=stale_cache, currency=currency)
-                            return {
-                                "query": query,
-                                "results": results,
-                                "source": "db_cache_stale",
-                                "catalog_size": len(stale_cache),
-                                "matched_count": matched_count,
-                            }
-                    except Exception:
-                        pass
+            )
 
-        stub_products = [
-            {
-                "product_id": "P-1001",
-                "variant_id": "V-1001",
-                "sku": "MALA-KARUNGALI-001",
-                "name": "Karungali Mala",
-                "price": 29.99,
-                "currency": "INR",
-                "description": "Traditional karungali wood mala used for daily wear and spiritual practice.",
-            },
-            {
-                "product_id": "P-1002",
-                "variant_id": "V-1002",
-                "sku": "MALA-RUDRA-001",
-                "name": "Rudraksha Mala",
-                "price": 34.5,
-                "currency": "INR",
-                "description": "Classic rudraksha mala with natural beads suitable for prayer and meditation.",
-            },
-            {
-                "product_id": "P-1003",
-                "variant_id": "V-1003",
-                "sku": "BRACELET-BLK-01",
-                "name": "Black Bead Bracelet",
-                "price": 15.0,
-                "currency": "INR",
-                "description": "Minimal black bead bracelet for casual everyday use.",
-            },
-        ]
-        tokens = self._query_tokens(query)
-        filtered_results: list[dict[str, Any]] = []
-        for product in stub_products:
-            searchable = f"{product['name']} {product['description']}".lower()
-            score = sum(1 for token in tokens if token in searchable)
-            if score > 0:
-                filtered_results.append({**product, "relevance": score})
-
-        filtered_results.sort(key=lambda item: item["relevance"], reverse=True)
         return {
             "query": query,
-            "results": filtered_results[: settings.catalog_search_result_limit],
-            "source": "stub_fallback" if self.shopify_enabled else "stub",
-            "catalog_size": len(stub_products),
-            "matched_count": len(filtered_results),
+            "results": normalized_results,
+            "source": source,
+            "catalog_size": len(candidate_products),
+            "matched_count": len(normalized_results),
+        }
+
+    def create_draft_order(self, variant_id: str, customer_email: str, quantity: int = 1) -> dict[str, Any]:
+        if not self.shopify_enabled:
+            raise RuntimeError("Shopify is not configured for draft order creation.")
+
+        cleaned_variant_id = str(variant_id).strip()
+        if not cleaned_variant_id:
+            raise RuntimeError("variant_id is required to create a draft order.")
+
+        safe_quantity = max(1, int(quantity or 1))
+        line_item_variant_id: int | str = int(cleaned_variant_id) if cleaned_variant_id.isdigit() else cleaned_variant_id
+
+        payload: dict[str, Any] = {
+            "draft_order": {
+                "line_items": [
+                    {
+                        "variant_id": line_item_variant_id,
+                        "quantity": safe_quantity,
+                    }
+                ],
+                "note": "Order placed via SATMI AI Chatbot (COD)",
+                "tags": "chatbot, COD",
+            }
+        }
+        if customer_email:
+            payload["draft_order"]["email"] = customer_email
+
+        response = self._request("POST", self._draft_orders_endpoint_url(), json=payload)
+        draft_order = response.get("draft_order", {})
+        if not draft_order:
+            raise RuntimeError("Shopify draft order creation returned an empty payload.")
+
+        return {
+            "draft_order_id": draft_order.get("id"),
+            "draft_order_name": draft_order.get("name"),
+            "invoice_url": draft_order.get("invoice_url"),
+            "currency": draft_order.get("currency"),
+            "total_price": float(draft_order.get("total_price") or 0.0),
         }
 
     def cancel_order(self, order_id: str, reason: str) -> dict:
@@ -465,80 +719,6 @@ class ToolingService:
             "reason": reason,
             "timestamp": datetime.utcnow().isoformat(),
             "source": "stub",
-        }
-
-    def place_order(
-        self,
-        *,
-        product_query: str,
-        quantity: int,
-        user_id: str,
-        authenticated_user: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        safe_quantity = max(1, int(quantity or 1))
-        search = self.search_products(product_query)
-        results = search.get("results", [])
-        source = str(search.get("source", "unknown"))
-
-        if not results:
-            return {
-                "placed": False,
-                "needs_input": True,
-                "message": "No close product match found.",
-                "source": source,
-                "quantity": safe_quantity,
-                "query": product_query,
-            }
-
-        selected = results[0]
-
-        if source == "shopify":
-            variant_id = selected.get("variant_id")
-            if not variant_id:
-                return {
-                    "placed": False,
-                    "needs_input": True,
-                    "message": "Matched product variant is unavailable for ordering.",
-                    "source": source,
-                    "selected_product": selected,
-                    "quantity": safe_quantity,
-                }
-
-            draft_payload: dict[str, Any] = {
-                "draft_order": {
-                    "line_items": [{"variant_id": int(variant_id), "quantity": safe_quantity}],
-                    "note": f"Created by SATMI chatbot for user {user_id}",
-                    "tags": "satmi-chatbot",
-                }
-            }
-
-            if authenticated_user and authenticated_user.get("email"):
-                draft_payload["draft_order"]["email"] = authenticated_user["email"]
-
-            response = self._request("POST", "/draft_orders.json", json=draft_payload)
-            draft_order = response.get("draft_order", {})
-            return {
-                "placed": bool(draft_order),
-                "order_mode": "draft_order",
-                "draft_order_id": draft_order.get("id"),
-                "draft_order_name": draft_order.get("name"),
-                "invoice_url": draft_order.get("invoice_url"),
-                "total_price": float(draft_order.get("total_price") or selected.get("price") or 0.0),
-                "currency": str(draft_order.get("currency") or selected.get("currency") or self._shop_currency()),
-                "selected_product": selected,
-                "quantity": safe_quantity,
-                "source": source,
-            }
-
-        # Do not fake checkout creation when the store is unavailable.
-        return {
-            "placed": False,
-            "requires_live_store": True,
-            "order_mode": "unavailable",
-            "selected_product": selected,
-            "quantity": safe_quantity,
-            "source": source,
-            "message": "Live Shopify order placement is unavailable right now.",
         }
 
     def process_cancel_task(self, payload: dict[str, Any]) -> dict[str, Any]:

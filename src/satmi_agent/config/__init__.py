@@ -7,6 +7,13 @@ class Settings(BaseSettings):
     llm_provider: str = "gemini"
     model_name: str = "gemini-2.0-flash"
     gemini_api_key: str | None = None
+    gemini_retry_count: int = 2
+    gemini_strict_retry_count: int = 1
+    gemini_retry_base_delay_seconds: float = 0.6
+    gemini_retry_max_delay_seconds: float = 8.0
+    gemini_retry_jitter_seconds: float = 0.35
+    gemini_retry_on_429: bool = True
+    gemini_retry_on_5xx: bool = True
     llm_response_refinement_enabled: bool = False
     database_url: str = "sqlite:///./satmi_agent.db"
     shopify_store_domain: str | None = None

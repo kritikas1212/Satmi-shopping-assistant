@@ -1,0 +1,13 @@
+{
+  "name": "satmi-chatbot-workspace",
+  "private": true,
+  "scripts": {
+    "dev": "npm --prefix satmi-frontend run dev",
+    "dev:frontend": "npm --prefix satmi-frontend run dev",
+    "build:frontend": "npm --prefix satmi-frontend run build",
+    "dev:backend": "./scripts/start_local_stack.sh"
+  },
+  "dependencies": {
+    "firebase": "^12.11.0"
+  }
+}

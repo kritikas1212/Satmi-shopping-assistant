@@ -197,6 +197,18 @@ class PersistenceService:
             )
             return list(session.scalars(stmt).all())
 
+    def list_recent_user_messages(self, user_id: str, limit: int = 20) -> list[str]:
+        with self._session() as session:
+            stmt = (
+                select(ConversationEventRecord)
+                .where(ConversationEventRecord.user_id == user_id)
+                .where(ConversationEventRecord.role == "user")
+                .order_by(ConversationEventRecord.created_at.desc())
+                .limit(limit)
+            )
+            rows = list(session.scalars(stmt).all())
+            return [str(row.message or "").strip() for row in rows if str(row.message or "").strip()]
+
     def create_async_task(
         self,
         *,

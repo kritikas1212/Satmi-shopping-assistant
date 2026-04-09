@@ -40,7 +40,9 @@ def _assert_no_ai_isms(text: str) -> None:
 
 
 def _assert_has_next_step(text: str) -> None:
-    assert "next step:" in text.lower()
+    lowered = text.lower()
+    assert "next step:" not in lowered
+    assert "you can continue by" in lowered or "would you like" in lowered
 
 
 def _assert_no_internal_leaks(text: str) -> None:

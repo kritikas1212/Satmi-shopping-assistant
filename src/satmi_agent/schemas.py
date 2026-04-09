@@ -1,21 +1,27 @@
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field
 
 
 class ChatRequest(BaseModel):
     user_id: str = Field(..., description="Unique customer id")
     conversation_id: str = Field(..., description="Conversation/thread id")
-    message: str = Field(..., min_length=1)
+    message: str = Field(default="", min_length=0)
+    action: Optional[str] = None
+    product_id: Optional[str] = None
+    customer_name: Optional[str] = None
+    shipping_address: Optional[str] = None
 
 
 class ChatResponse(BaseModel):
     conversation_id: str
     status: Literal["active", "awaiting_human", "resolved"]
-    response: str
-    intent: Literal["support", "shopping", "mixed", "unknown"]
+    response_text: str
+    recommended_products: list[dict[str, Any]] = Field(default_factory=list)
+    auth_required: bool = False
+    intent: Literal["shopping", "order_tracking", "policy_brand_faq", "general", "authentication", "unknown"]
     confidence: float
     handoff_id: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -26,7 +32,7 @@ class HandoffTicket(BaseModel):
     conversation_id: str
     summary: str
     reason: str
-    intent: Literal["support", "shopping", "mixed", "unknown"]
+    intent: Literal["shopping", "order_tracking", "policy_brand_faq", "general", "authentication", "unknown"]
     attempted_action: str | None = None
     tool_result: dict[str, Any] = Field(default_factory=dict)
     errors: list[str] = Field(default_factory=list)
@@ -87,3 +93,23 @@ class AsyncTaskResponse(BaseModel):
     created_at: str
     updated_at: str
     completed_at: str | None = None
+
+
+class SendOtpRequest(BaseModel):
+    phone_number: str = Field(..., min_length=10, max_length=20, validation_alias=AliasChoices("phone_number", "phone"))
+
+
+class SendOtpResponse(BaseModel):
+    success: bool
+    message: str
+
+
+class VerifyOtpRequest(BaseModel):
+    phone_number: str = Field(..., min_length=10, max_length=20, validation_alias=AliasChoices("phone_number", "phone"))
+    otp: str = Field(..., min_length=6, max_length=6)
+
+
+class VerifyOtpResponse(BaseModel):
+    success: bool
+    token: str | None = None
+    message: str

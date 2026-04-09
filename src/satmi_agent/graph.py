@@ -8,10 +8,11 @@ from satmi_agent.nodes import (
     classify_intent,
     compose_response,
     execute_action,
+    general_conversation,
     handoff_to_human_node,
     input_guardrails,
     policy_guard,
-    retrieve_policy_node,
+    route_after_policy_guard,
     should_handoff,
 )
 from satmi_agent.state import AgentState
@@ -38,7 +39,7 @@ def build_graph():
     graph.add_node("classify_intent", classify_intent)
     graph.add_node("input_guardrails", input_guardrails)
     graph.add_node("policy_guard", policy_guard)
-    graph.add_node("retrieve_policy", retrieve_policy_node)
+    graph.add_node("general_conversation", general_conversation)
     graph.add_node("execute_action", execute_action)
     graph.add_node("compose_response", compose_response)
     graph.add_node("handoff_to_human", handoff_to_human_node)
@@ -46,9 +47,15 @@ def build_graph():
     graph.add_edge(START, "input_guardrails")
     graph.add_edge("input_guardrails", "classify_intent")
     graph.add_edge("classify_intent", "policy_guard")
-    graph.add_edge("policy_guard", "retrieve_policy")
-    graph.add_edge("retrieve_policy", "execute_action")
-
+    graph.add_conditional_edges(
+        "policy_guard",
+        route_after_policy_guard,
+        {
+            "handoff_to_human": "handoff_to_human",
+            "general_conversation": "general_conversation",
+            "retrieve_policy": "execute_action",
+        },
+    )
     graph.add_conditional_edges(
         "execute_action",
         should_handoff,
@@ -59,6 +66,7 @@ def build_graph():
     )
 
     graph.add_edge("compose_response", END)
+    graph.add_edge("general_conversation", END)
     graph.add_edge("handoff_to_human", END)
 
     return graph.compile(checkpointer=_build_checkpointer())

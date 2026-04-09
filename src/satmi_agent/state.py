@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, Literal, TypedDict
 
 
-Intent = Literal["support", "shopping", "mixed", "unknown"]
+Intent = Literal["shopping", "order_tracking", "policy_brand_faq", "general", "authentication", "unknown"]
 Status = Literal["active", "awaiting_human", "resolved"]
 
 
@@ -22,6 +22,9 @@ class AgentState(TypedDict, total=False):
     tool_result: dict[str, Any]
     errors: list[str]
     response: str
+    response_text: str
+    recommended_products: list[dict[str, Any]]
+    auth_required: bool
     handoff_id: str
     handoff_reason: str
     audit_log: list[dict[str, Any]]
@@ -37,4 +40,9 @@ class AgentState(TypedDict, total=False):
     human_resolution_message: str
     user_authenticated: bool
     authenticated_user: dict[str, Any]
+    selected_product_id: str
+    selected_product_name: str
     order_context: list[dict[str, Any]]
+    context_packet: dict[str, Any]
+    conversation_summary: str
+    user_preferences: dict[str, Any]

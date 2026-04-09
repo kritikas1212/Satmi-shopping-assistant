@@ -157,6 +157,22 @@ def verify_firebase_user(token: str | None) -> dict[str, Any] | None:
         return None
 
 
+def verify_firebase_token(
+    request: Request,
+    authorization: str | None = Header(default=None),
+    x_firebase_token: str | None = Header(default=None),
+) -> dict[str, Any] | None:
+    """Best-effort Firebase verification.
+
+    This dependency never raises auth HTTP errors for chat endpoints. It only
+    attaches verified user data to request state when the token is valid.
+    """
+    token = x_firebase_token or extract_bearer_token(authorization)
+    user = verify_firebase_user(token)
+    request.state.firebase_user = user
+    return user
+
+
 def firebase_auth_health() -> dict[str, Any]:
     enabled = settings.firebase_auth_enabled
     initialized = _init_firebase() if enabled else False
