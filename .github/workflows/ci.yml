@@ -26,9 +26,13 @@ jobs:
       - name: Run tests
         env:
           PYTHONPATH: src
+          DATABASE_URL: "sqlite:///./satmi_agent_ci.db"
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: pytest -q
 
       - name: Run golden query evaluation
         env:
           PYTHONPATH: src
+          DATABASE_URL: "sqlite:///./satmi_agent_ci.db"
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: python scripts/evaluate_golden_set.py --min-pass-rate 0.80
