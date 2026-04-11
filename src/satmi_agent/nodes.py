@@ -161,6 +161,54 @@ TEMP_AI_CORE_ISSUE_MESSAGE = (
     "I am currently experiencing a temporary connection issue to my AI core. "
     "Please try asking your question again in a moment."
 )
+
+SUPPORT_PORTAL_URL = "https://accounts.satmi.in"
+SUPPORT_EMAIL = "support@satmi.in"
+SUPPORT_PHONE = "+919403891731"
+ORDER_TRACKING_URL = "https://satmi.in/pages/track-your-order"
+SUPPORT_RESPONSE_TIME = "within 24 hours"
+
+PORTAL_BOUND_PHRASES = {
+    "update address",
+    "change address",
+    "address update",
+    "add address",
+    "update phone number",
+    "change phone number",
+    "update phone",
+    "change phone",
+    "phone number in order",
+    "number in order",
+    "replacement request",
+    "replacement order",
+    "replace my order",
+    "cancel order",
+    "order cancellation",
+}
+PORTAL_BOUND_KEYWORDS = {
+    "cancel",
+    "cancellation",
+    "address",
+    "replacement",
+    "replace",
+    "return",
+    "modify",
+}
+SUPPORT_CONTACT_PHRASES = {
+    "contact me",
+    "contact us",
+    "contact support",
+    "send whatsapp",
+    "whatsapp",
+    "call me",
+    "phone number",
+    "mobile number",
+    "reach me",
+    "get in touch",
+    "message me",
+}
+SUPPORT_CONTACT_KEYWORDS = {"whatsapp", "contact", "call", "phone", "mobile", "email", "support"}
+
 SEARCH_STOPWORDS = {
     "i",
     "need",
@@ -307,26 +355,28 @@ def _contains_authentication_intent(message: str) -> bool:
 
 
 def _extract_search_query(message: str) -> str:
-    """Extract a concise 1-3 word catalog query from conversational text."""
+    """Extract a cleaned catalog query without over-compressing it."""
     llm_query = extract_search_keywords_with_llm(user_message=message)
     if llm_query:
-        return llm_query
+        cleaned_llm_query = " ".join(llm_query.split()).strip()
+        return cleaned_llm_query or DEFAULT_DISCOVERY_QUERY
 
-    text = message.lower()
-    chunks = re.split(r"\b(?:vs|versus|and|with|for)\b", text)
-    candidate = chunks[0] if chunks else text
-    tokens = re.findall(r"[a-zA-Z0-9']+", candidate)
+    text = " ".join((message or "").split()).strip().lower()
+    if not text:
+        return DEFAULT_DISCOVERY_QUERY
+
+    tokens = re.findall(r"[a-zA-Z0-9']+", text)
     filtered = [tok for tok in tokens if tok not in SEARCH_STOPWORDS and len(tok) > 1]
 
     if not filtered:
         filtered = [tok for tok in tokens if len(tok) > 1]
     if not filtered:
-        return "product"
+        return DEFAULT_DISCOVERY_QUERY
 
-    # Prefer known product/material words when present.
     preferred = [tok for tok in filtered if tok in PRODUCT_INFO_KEYWORDS or tok in {"karungali", "rudraksha", "crystal"}]
-    shortlist = preferred[:3] if preferred else filtered[:3]
-    return " ".join(shortlist).strip() or "product"
+    query_tokens = preferred if preferred else filtered
+    cleaned_query = " ".join(query_tokens).strip()
+    return cleaned_query or DEFAULT_DISCOVERY_QUERY
 
 
 def _is_comparison_request(message: str, words: set[str]) -> bool:
@@ -361,6 +411,53 @@ def _requested_human_assistance(message: str, words: set[str]) -> bool:
     if any(phrase in lowered for phrase in EXPLICIT_HUMAN_PHRASES):
         return True
     return bool(words.intersection(HUMAN_REQUEST_KEYWORDS) and ("talk" in words or "transfer" in words))
+
+
+def _is_portal_bound_support_request(message: str, words: set[str]) -> bool:
+    lowered = message.lower()
+    if any(phrase in lowered for phrase in PORTAL_BOUND_PHRASES):
+        return True
+    return bool(words.intersection(PORTAL_BOUND_KEYWORDS) and ("order" in words or "address" in words or "replacement" in words))
+
+
+def _is_support_contact_request(message: str, words: set[str]) -> bool:
+    lowered = message.lower()
+    if any(phrase in lowered for phrase in SUPPORT_CONTACT_PHRASES):
+        return True
+    return bool(words.intersection(SUPPORT_CONTACT_KEYWORDS) and ("me" in words or "support" in words or "team" in words))
+
+
+def _is_order_tracking_request(message: str, words: set[str]) -> bool:
+    lowered = message.lower()
+    if any(phrase in lowered for phrase in {"where is my order", "track my order", "order status", "status of order", "track order", "where is it"}):
+        return True
+    return bool(words.intersection({"track", "tracking", "status", "delivery"}) and "order" in words)
+
+
+def _portal_redirect_response(*, include_contact_details: bool = True) -> str:
+    response = (
+        f"I'd be happy to help with your order! For cancellations, address or phone updates, and replacement requests, the fastest way is to manage it securely through our portal at {SUPPORT_PORTAL_URL}."
+    )
+    if include_contact_details:
+        response += (
+            f" If you need further assistance, our team is always ready to help at {SUPPORT_EMAIL} or {SUPPORT_PHONE} (we usually reply {SUPPORT_RESPONSE_TIME})."
+        )
+    return response
+
+
+def _support_contact_response(*, mention_portal: bool = True) -> str:
+    response = (
+        f"I'm here to help! Feel free to contact our dedicated support team at {SUPPORT_EMAIL} or call us directly at {SUPPORT_PHONE}. We typically reply {SUPPORT_RESPONSE_TIME}."
+    )
+    if mention_portal:
+        response += (
+            f" Also, just a quick tip: you can instantly manage cancellations, address updates, and replacements yourself over at {SUPPORT_PORTAL_URL}."
+        )
+    return response
+
+
+def _order_tracking_response(*, mention_portal: bool = True) -> str:
+    return f"I can certainly help you keep an eye on your delivery! You can easily check the latest status of your order right here: {ORDER_TRACKING_URL}."
 
 
 def _is_legal_or_financial_dispute(message: str, words: set[str]) -> bool:
@@ -602,23 +699,17 @@ def classify_intent(state: AgentState) -> AgentState:
     message = state.get("message", "")
     words = _tokenize(message)
 
+    # 1. Check system/auth overrides first
     if _parse_selected_product_intent(message):
         intent = "shopping"
         confidence = 1.0
         classification_source = "system_intent_select_product"
-    elif _is_brand_faq(message, words) or _is_policy_question(message, words):
-        intent = "policy_brand_faq"
-        confidence = 1.0
-        classification_source = "keyword_policy_faq"
-    elif _must_force_product_tool_usage(message, words):
-        intent = "shopping"
-        confidence = 1.0
-        classification_source = "forced_product_tool_usage"
     elif _contains_authentication_intent(message):
         intent = "authentication"
         confidence = 1.0
         classification_source = "keyword_authentication"
     else:
+        # 2. Delegate everything else directly to the Semantic LLM Supervisor
         llm_intent = classify_intent_with_llm(
             user_message=message,
             message_history=state.get("message_history", []),
@@ -626,14 +717,10 @@ def classify_intent(state: AgentState) -> AgentState:
         if llm_intent is not None:
             intent, confidence = llm_intent
             classification_source = "llm"
-            if intent == "shopping" and not _is_store_related(message, words):
-                intent = "general"
-                confidence = min(confidence, 0.55)
-                classification_source = "llm_demoted_non_store_related"
         else:
             intent = "general"
-            confidence = 0.5
-            classification_source = "llm_unavailable_default"
+            confidence = 0.0
+            classification_source = "fallback"
 
     requested_human = _requested_human_assistance(message, words)
     out_of_scope = _is_legal_or_financial_dispute(message, words)
@@ -717,6 +804,8 @@ def route_after_policy_guard(state: AgentState) -> str:
     words = _tokenize(message)
     if not state.get("policy_ok", True):
         return "handoff_to_human"
+    if _is_portal_bound_support_request(message, words) or _is_support_contact_request(message, words) or _is_order_tracking_request(message, words):
+        return "retrieve_policy"
     if _must_force_product_tool_usage(message, words):
         return "retrieve_policy"
     if state.get("intent") in {"policy_brand_faq", "general"}:
@@ -752,6 +841,109 @@ def general_conversation(state: AgentState) -> AgentState:
     )
 
     words = _tokenize(user_message)
+    if _is_portal_bound_support_request(user_message, words):
+        response = _portal_redirect_response(include_contact_details=True)
+        return {
+            **state,
+            "action": "portal_redirect",
+            "status": "active",
+            "response": response,
+            "response_text": response,
+            "recommended_products": [],
+            "tool_result": {
+                "redirect_url": SUPPORT_PORTAL_URL,
+                "support_email": SUPPORT_EMAIL,
+                "support_response_time": SUPPORT_RESPONSE_TIME,
+            },
+            "message_history": history,
+            "user_preferences": {},
+            "conversation_summary": _conversation_summary({**state, "message_history": history}),
+            "context_packet": {
+                "policy_snippets": policy_context,
+                "product_snippets": [],
+                "recent_conversation_summary": _conversation_summary({**state, "message_history": history}),
+                "user_state": {
+                    "authenticated": bool(state.get("user_authenticated", False)),
+                    "order_intent": False,
+                    "preferences": {},
+                },
+            },
+            "internal_logs": [
+                *_state_logs(state),
+                {
+                    "event": "general_conversation_portal_redirect",
+                    "support_portal_url": SUPPORT_PORTAL_URL,
+                },
+            ],
+        }
+    if _is_support_contact_request(user_message, words):
+        response = _support_contact_response(mention_portal=True)
+        return {
+            **state,
+            "action": "support_contact",
+            "status": "active",
+            "response": response,
+            "response_text": response,
+            "recommended_products": [],
+            "tool_result": {
+                "support_email": SUPPORT_EMAIL,
+                "support_response_time": SUPPORT_RESPONSE_TIME,
+                "support_portal_url": SUPPORT_PORTAL_URL,
+            },
+            "message_history": history,
+            "user_preferences": {},
+            "conversation_summary": _conversation_summary({**state, "message_history": history}),
+            "context_packet": {
+                "policy_snippets": policy_context,
+                "product_snippets": [],
+                "recent_conversation_summary": _conversation_summary({**state, "message_history": history}),
+                "user_state": {
+                    "authenticated": bool(state.get("user_authenticated", False)),
+                    "order_intent": False,
+                    "preferences": {},
+                },
+            },
+            "internal_logs": [
+                *_state_logs(state),
+                {
+                    "event": "general_conversation_support_contact",
+                    "support_email": SUPPORT_EMAIL,
+                },
+            ],
+        }
+    if _is_order_tracking_request(user_message, words):
+        response = _order_tracking_response(mention_portal=False)
+        return {
+            **state,
+            "action": "order_tracking_redirect",
+            "status": "active",
+            "response": response,
+            "response_text": response,
+            "recommended_products": [],
+            "tool_result": {
+                "redirect_url": ORDER_TRACKING_URL,
+            },
+            "message_history": history,
+            "user_preferences": {},
+            "conversation_summary": _conversation_summary({**state, "message_history": history}),
+            "context_packet": {
+                "policy_snippets": policy_context,
+                "product_snippets": [],
+                "recent_conversation_summary": _conversation_summary({**state, "message_history": history}),
+                "user_state": {
+                    "authenticated": bool(state.get("user_authenticated", False)),
+                    "order_intent": False,
+                    "preferences": {},
+                },
+            },
+            "internal_logs": [
+                *_state_logs(state),
+                {
+                    "event": "general_conversation_order_tracking_redirect",
+                    "redirect_url": ORDER_TRACKING_URL,
+                },
+            ],
+        }
     history_text = [str(item.get("content", "")).strip() for item in history if str(item.get("content", "")).strip()]
     try:
         recent_user_messages = persistence_service.list_recent_user_messages(state.get("user_id", "unknown"), limit=20)
@@ -808,20 +1000,22 @@ def general_conversation(state: AgentState) -> AgentState:
 
 def execute_action(state: AgentState) -> AgentState:
     intent = str(state.get("intent", "")).strip().lower()
-    if intent in {"policy_brand_faq", "general"}:
+    message = state.get("message", "")
+    words = _tokenize(message)
+
+    if intent in {"policy_brand_faq", "general"} and not (_is_portal_bound_support_request(message, words) or _is_support_contact_request(message, words) or _is_order_tracking_request(message, words)):
         return {
             **state,
             "action": "general_conversation",
             "tool_result": {}
         }
 
-    message = state.get("message", "")
     user_id = state.get("user_id", "unknown")
     intent = intent or "unknown"
 
     # Strict routing by classified intent: only shopping can trigger product search.
     if intent != "shopping":
-        if intent in {"policy_brand_faq", "general"}:
+        if intent in {"policy_brand_faq", "general"} and not (_is_portal_bound_support_request(message, words) or _is_support_contact_request(message, words) or _is_order_tracking_request(message, words)):
             return {
                 **state,
                 "action": "general_conversation",
@@ -829,25 +1023,66 @@ def execute_action(state: AgentState) -> AgentState:
                 "internal_logs": [*_state_logs(state), {"event": "action_bypassed_by_intent", "intent": intent}],
             }
 
-        if intent == "order_tracking":
-            tool_result = tooling_service.get_customer_orders(user_id)
+        # Rule-based overrides take priority over LLM intent (e.g. portal requests)
+        if _is_portal_bound_support_request(message, words):
+            order_id = _extract_order_reference(message)
+            tool_result = {
+                "order_id": order_id,
+                "redirect_url": SUPPORT_PORTAL_URL,
+                "support_email": SUPPORT_EMAIL,
+                "support_response_time": SUPPORT_RESPONSE_TIME,
+                "reason": "Managed through account portal",
+            }
             return {
                 **state,
-                "action": "get_customer_orders",
+                "action": "portal_redirect",
                 "tool_result": tool_result,
                 "internal_logs": [
                     *_state_logs(state),
-                    {"event": "action_executed", "action": "get_customer_orders", "order_count": len(tool_result.get("orders", [])), "error_count": 0},
+                    {"event": "action_executed", "action": "portal_redirect", "order_id": order_id, "error_count": 0},
+                ],
+            }
+
+        if _is_order_tracking_request(message, words) or intent == "order_tracking":
+            tool_result = {
+                "redirect_url": ORDER_TRACKING_URL,
+                "reason": "Tracking redirects to global track-your-order page",
+            }
+            return {
+                **state,
+                "action": "order_tracking_redirect",
+                "tool_result": tool_result,
+                "internal_logs": [
+                    *_state_logs(state),
+                    {"event": "action_executed", "action": "order_tracking_redirect", "error_count": 0},
+                ],
+            }
+
+        if _is_support_contact_request(message, words):
+            tool_result = {
+                "support_email": SUPPORT_EMAIL,
+                "support_response_time": SUPPORT_RESPONSE_TIME,
+                "support_portal_url": SUPPORT_PORTAL_URL,
+                "reason": "Customer requested contact details",
+            }
+            return {
+                **state,
+                "action": "support_contact",
+                "tool_result": tool_result,
+                "internal_logs": [
+                    *_state_logs(state),
+                    {"event": "action_executed", "action": "support_contact", "error_count": 0},
                 ],
             }
 
         # Cancellation requests go to portal.
-        words = _tokenize(message)
         if "cancel" in words and "order" in words:
             order_id = _extract_order_reference(message)
             tool_result = {
                 "order_id": order_id,
-                "redirect_url": "https://accounts.satmi.in",
+                "redirect_url": SUPPORT_PORTAL_URL,
+                "support_email": SUPPORT_EMAIL,
+                "support_response_time": SUPPORT_RESPONSE_TIME,
                 "reason": "No-cancel policy in chatbot channel",
             }
             return {
@@ -1023,37 +1258,6 @@ def compose_response(state: AgentState) -> AgentState:
                 }
             )
 
-    if not recommended_products and intent == "shopping":
-        try:
-            fallback_query = _extract_search_query(str(state.get("message", "")))
-            if not fallback_query or fallback_query == "product":
-                fallback_query = DEFAULT_DISCOVERY_QUERY
-            fallback_result = tooling_service.search_products(fallback_query)
-            for item in (fallback_result.get("results") or [])[:8]:
-                title = str(item.get("title") or item.get("name") or "").strip()
-                if not title:
-                    continue
-                recommended_products.append(
-                    {
-                        "product_id": str(item.get("product_id") or item.get("id") or "") or None,
-                        "variant_id": str(item.get("variant_id") or "") or None,
-                        "handle": str(item.get("handle") or "") or None,
-                        "url": str(item.get("url") or item.get("product_url") or "") or None,
-                        "title": title,
-                        "price": _format_price(item.get("price"), item.get("currency")),
-                        "image_url": (
-                            item.get("image_url").get("src")
-                            if isinstance(item.get("image_url"), dict)
-                            else str(item.get("image_url") or item.get("image") or "https://placehold.co/640x400/F9F6F2/7A1E1E?text=SATMI")
-                        ),
-                        "product_url": item.get("product_url") or item.get("url"),
-                    }
-                )
-            if fallback_result:
-                tool_result = fallback_result
-        except Exception:
-            pass
-
     # Strict wipe: only shopping intent gets product cards.
     if intent != "shopping":
         recommended_products = []
@@ -1080,6 +1284,8 @@ def compose_response(state: AgentState) -> AgentState:
 
     next_step_guidance_map = {
         "cancel_redirect": "Ask the customer to sign in at accounts.satmi.in and manage cancellation from order details.",
+        "portal_redirect": "Ask the customer to sign in at accounts.satmi.in for cancellation, address updates, or replacement requests.",
+        "support_contact": "Ask the customer to contact support@satmi.in and mention the support response window.",
         "place_order": "Confirm quantity and delivery pincode, then guide payment completion if invoice URL exists.",
         "get_customer_orders": "Offer tracking, cancellation guidance, or reorder assistance for the latest order.",
         "search_products": "Offer shortlist refinement by intent, budget, or comparison preference.",
@@ -1100,6 +1306,9 @@ def compose_response(state: AgentState) -> AgentState:
         "comparison_requested": tool_result.get("comparison_requested"),
         "result_count": len(tool_result.get("results") or []),
         "results": product_snippets,
+        "redirect_url": tool_result.get("redirect_url"),
+        "support_email": tool_result.get("support_email"),
+        "support_response_time": tool_result.get("support_response_time"),
     }
 
     response_source = "llm"
@@ -1117,6 +1326,15 @@ def compose_response(state: AgentState) -> AgentState:
         else:
             response = "Here are some excellent choices. Click the Select & Buy button on any product to proceed to our website for checkout."
         response_source = "auth_intercept"
+    elif action == "portal_redirect":
+        response = _portal_redirect_response(include_contact_details=True)
+        response_source = "portal_redirect"
+    elif action == "support_contact":
+        response = _support_contact_response(mention_portal=True)
+        response_source = "support_contact"
+    elif action == "order_tracking_redirect":
+        response = _order_tracking_response(mention_portal=False)
+        response_source = "order_tracking_redirect"
     elif str(tool_result.get("error", "")).strip().lower() == "catalog unavailable":
         response = (
             "I am having trouble loading the live catalog right now. "

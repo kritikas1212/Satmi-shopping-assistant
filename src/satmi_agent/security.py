@@ -20,10 +20,22 @@ CARD_PATTERN = re.compile(r"\b\d{13,19}\b")
 
 
 def mask_pii_text(value: str) -> str:
+    # Preserve known public contact info before applying generic masks
+    value = value.replace("support@satmi.in", "___SUPPORT_EMAIL___")
+    value = value.replace("+919403891731", "___SUPPORT_PHONE___")
+
     masked = EMAIL_PATTERN.sub("[masked-email]", value)
     masked = PHONE_PATTERN.sub("[masked-phone]", masked)
     masked = CARD_PATTERN.sub("[masked-card]", masked)
+
+    # Restore the public contact info
+    masked = masked.replace("___SUPPORT_EMAIL___", "support@satmi.in")
+    masked = masked.replace("___SUPPORT_PHONE___", "+919403891731")
     return masked
+
+
+def preserve_support_email_text(value: str) -> str:
+    return value.replace("[masked-email]", "support@satmi.in")
 
 
 def scrub_pii(value: Any) -> Any:

@@ -1,8 +1,12 @@
-for server startup cd /Users/kritikasingh/Downloads/Satmi-Chatbot
+*for server startup
+cd /Users/kritikasingh/Downloads/Satmi-Chatbot
 source .venv/bin/activate
 PYTHONPATH=src uvicorn satmi_agent.main:app --host 0.0.0.0 --port 8000 2>&1 | tee backend.log
 
+*startup with database
+DATABASE_URL=sqlite:///./satmi_agent.db PYTHONPATH=src uvicorn satmi_agent.main:app --host 0.0.0.0 --port 8000 2>&1 | tee backend.log
 
+If you already have a `.env` file that points `DATABASE_URL` at PostgreSQL, this command overrides it for local SQLite startup.
 
 
 # SATMI Chatbot (LangGraph + LangChain)

@@ -11,7 +11,10 @@ from email.utils import parsedate_to_datetime
 import httpx
 
 from satmi_agent.config import settings
-from satmi_agent.config.persona import FINAL_SYSTEM_PROMPT as SATMI_SYSTEM_PROMPT
+from satmi_agent.config.persona import (
+    FINAL_SYSTEM_PROMPT as SATMI_SYSTEM_PROMPT,
+    GENERAL_CONVERSATION_SYSTEM_PROMPT,
+)
 
 
 MAX_OUTPUT_TOKENS = 4096
@@ -169,6 +172,14 @@ def _parse_intent_json(raw: str) -> tuple[str, float] | None:
     match = re.search(r'\{.*\}', raw, re.DOTALL)
     clean_str = match.group(0) if match else raw.strip()
 
+    if clean_str.startswith("```json"):
+        clean_str = clean_str[7:]
+    elif clean_str.startswith("```"):
+        clean_str = clean_str[3:]
+    if clean_str.endswith("```"):
+        clean_str = clean_str[:-3]
+    clean_str = clean_str.strip()
+
     payload: dict[str, object] | None = None
     try:
         payload = json.loads(clean_str)
@@ -274,14 +285,21 @@ def classify_intent_with_llm(*, user_message: str, message_history: list[dict[st
         "- order_tracking\n"
         "- policy_brand_faq\n"
         "- general\n\n"
-        "Use policy_brand_faq for brand/about/shipping/returns/policy/store FAQ questions.\n"
-        "Use order_tracking for order status, shipment tracking, cancellation, or delivery status queries.\n"
-        "Use shopping for product discovery, recommendations, product details, comparisons, or buying intent.\n"
-        "Use general for everything else.\n\n"
+        "CRITICAL ROUTING RULES:\n"
+        "- Map to 'shopping' if the user asks for recommendations, specific items (e.g., 'Karungali', 'Rudraksha'), OR asks broad discovery questions like 'What do you offer?', 'What products do you sell?', 'Show me your collection', or 'I need a gift.'\n"
+        "- Map to 'policy_brand_faq' ONLY if they ask about shipping, returns, refunds, guarantees (2X assurance), or contact info.\n"
+        "- Map to 'order_tracking' for tracking orders, delivery status, shipment info, or cancellations.\n"
+        "- Map to 'general' for simple greetings or non-commerce chit-chat.\n\n"
         "Return ONLY compact JSON with keys intent and confidence.\n"
         "Example: {\"intent\":\"shopping\",\"confidence\":0.92}\n\n"
         f"Conversation history:\n{chr(10).join(history_lines) if history_lines else '- none'}\n\n"
         f"Latest user message: {user_message}"
+    )
+
+    system_prompt = (
+        f"{SATMI_SYSTEM_PROMPT}\n\n"
+        "ABSOLUTE RULE: You must respond with ONLY a valid, raw JSON object. Do not include markdown backticks. "
+        "Do not include conversational text like 'Here is the JSON'. Your output must be instantly parsable by json.loads()."
     )
 
     endpoint = (
@@ -289,11 +307,11 @@ def classify_intent_with_llm(*, user_message: str, message_history: list[dict[st
         f"?key={settings.gemini_api_key}"
     )
     payload = {
-        "system_instruction": {"parts": [{"text": SATMI_SYSTEM_PROMPT}]},
+        "system_instruction": {"parts": [{"text": system_prompt}]},
         "contents": [{"parts": [{"text": user_prompt}]}],
         "generationConfig": {
             "temperature": 0.0,
-            "maxOutputTokens": 80,
+            "maxOutputTokens": 200,
             "responseMimeType": "application/json",
         },
     }
@@ -323,11 +341,33 @@ def classify_intent_with_llm(*, user_message: str, message_history: list[dict[st
         llm_logger.error("classify_intent_with_llm: empty text body=%s", json.dumps(body, ensure_ascii=True)[:2000])
         return None
 
-    parsed = _parse_intent_json(text)
-    if parsed is None:
+    # --- STRIP MARKDOWN FORMATTING ---
+    if text.startswith("```json"):
+        text = text[7:]
+    elif text.startswith("```"):
+        text = text[3:]
+    if text.endswith("```"):
+        text = text[:-3]
+    text = text.strip()
+    # ---------------------------------
+
+    try:
+        parsed = json.loads(text)
+    except Exception:
         llm_logger.error("classify_intent_with_llm: invalid JSON output text=%s", text[:1200])
         return None
-    return parsed
+
+    intent = str(parsed.get("intent", "")).strip().lower()
+    if intent not in {"shopping", "order_tracking", "policy_brand_faq", "general"}:
+        return None
+
+    try:
+        confidence = float(parsed.get("confidence", 0.0))
+    except Exception:
+        confidence = 0.0
+
+    confidence = max(0.0, min(1.0, confidence))
+    return intent, confidence
 
 
 def _ensure_system_prompt_first(message_history: list[dict[str, str]] | None, system_prompt: str) -> list[dict[str, str]]:
@@ -443,7 +483,7 @@ def generate_general_conversation_response(
     if not settings.gemini_api_key:
         return None
 
-    system_prompt = SATMI_SYSTEM_PROMPT
+    system_prompt = GENERAL_CONVERSATION_SYSTEM_PROMPT
 
     normalized_history = _ensure_system_prompt_first(message_history, system_prompt)
 
@@ -537,13 +577,18 @@ def compose_structured_response_with_llm(
         "policy_context": policy_context or [],
         # DO NOT pass the actual product arrays to the LLM to prevent text duplication
         "products_found": len(recommended_products or []),
-        "next_step_guidance": next_step_guidance,
+        "next_step_guidance": (
+            "Guide the user to click 'Select & Buy' on their favorite piece below."
+            if next_step_guidance
+            else next_step_guidance
+        ),
     }
 
     system_prompt = (
         f"{SATMI_SYSTEM_PROMPT}\n\n"
-        "You are the SATMI Concierge. The UI will automatically display product cards below your message. "
-        "NEVER list products, prices, or links in your text. Just write a warm, elegant 1-2 sentence introduction to the visual catalog."
+        "You are the SATMI Luxury Spiritual Concierge. The UI will automatically display the product cards below your text. "
+        "NEVER list products, prices, or links. Instead, write a highly elegant, luxurious 1-2 sentence introduction to the visual catalog. "
+        "Emphasize that our pieces are authentic, handcrafted, and Govt. Lab Certified."
     )
 
     user_prompt = (

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
 import time
@@ -38,6 +39,7 @@ from satmi_agent.security import (
     firebase_auth_health,
     require_api_key,
     require_support_role,
+    preserve_support_email_text,
     scrub_pii,
     verify_firebase_token,
 )
@@ -50,9 +52,28 @@ except Exception:  # pragma: no cover
     Command = None
 
 
+async def _warm_catalog_cache() -> None:
+    if not settings.catalog_cache_enabled:
+        return
+
+    try:
+        fetch_products = (
+            tooling_service._fetch_all_shopify_products
+            if tooling_service.shopify_enabled
+            else tooling_service._fetch_public_storefront_products
+        )
+        products = await asyncio.to_thread(fetch_products)
+        if not products:
+            return
+        await asyncio.to_thread(persistence_service.upsert_product_catalog, products)
+    except Exception:
+        return
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     persistence_service.init_db()
+    await _warm_catalog_cache()
     ensure_firebase_ready_or_raise()
     setup_tracing()
     yield
@@ -115,6 +136,19 @@ async def metrics_middleware(request: Request, call_next):
 
 def _to_iso(value) -> str | None:
     return value.isoformat() if value else None
+
+
+def _normalize_chat_intent(value: Any) -> str:
+    allowed = {"shopping", "order_tracking", "policy_brand_faq", "general", "authentication", "unknown"}
+    normalized = str(value or "unknown").strip().lower()
+    return normalized if normalized in allowed else "general"
+
+
+def _normalize_user_visible_text(text: str, *, preserve_support_email: bool = False) -> str:
+    masked = scrub_pii(text)
+    if preserve_support_email:
+        return preserve_support_email_text(masked)
+    return masked
 
 
 def _mask_secret(value: str | None, *, visible_prefix: int = 4) -> str | None:
@@ -267,37 +301,6 @@ def _safe_recommended_products(products: list[dict[str, Any]]) -> list[dict[str,
     return safe_products
 
 
-def _fallback_recommended_products(user_message: str) -> tuple[list[dict[str, Any]], str | None]:
-    """Last-mile backend safeguard to keep card rendering available in all chat responses."""
-    try:
-        fallback_query = user_message.strip() if user_message and user_message.strip() else "SATMI best sellers"
-        tool_payload = tooling_service.search_products(fallback_query)
-        fallback_results = tool_payload.get("results") if isinstance(tool_payload, dict) else []
-        if isinstance(fallback_results, list) and fallback_results:
-            normalized = _safe_recommended_products(
-                [
-                    {
-                        "product_id": item.get("product_id") or item.get("id"),
-                        "variant_id": item.get("variant_id"),
-                        "handle": item.get("handle"),
-                        "url": item.get("url") or item.get("product_url"),
-                        "title": item.get("title") or item.get("name") or "SATMI Product",
-                        "price": item.get("price"),
-                        "image_url": item.get("image_url") or item.get("image"),
-                        "product_url": item.get("product_url") or item.get("url"),
-                    }
-                    for item in fallback_results[:8]
-                    if isinstance(item, dict)
-                ]
-            )
-            source = str(tool_payload.get("source") or "fallback_search") if isinstance(tool_payload, dict) else "fallback_search"
-            return normalized, source
-    except Exception:
-        pass
-
-    return [], None
-
-
 def _is_product_related_query(message: str) -> bool:
     lowered = (message or "").lower()
     product_hints = {
@@ -420,9 +423,16 @@ def chat(
 
     message_history = final_state.get("message_history", message_history)
     if final_state.get("response"):
+        preserve_support_email = final_state.get("action") in {"portal_redirect", "support_contact"}
         message_history = [
             *message_history,
-            {"role": "assistant", "content": scrub_pii(final_state.get("response", ""))},
+            {
+                "role": "assistant",
+                "content": _normalize_user_visible_text(
+                    final_state.get("response", ""),
+                    preserve_support_email=preserve_support_email,
+                ),
+            },
         ]
 
     persistence_service.upsert_handoff_from_state(final_state)
@@ -444,7 +454,7 @@ def chat(
     )
 
     status_value = final_state.get("status", "active")
-    intent_value = final_state.get("intent", "unknown")
+    intent_value = _normalize_chat_intent(final_state.get("intent", "unknown"))
     recommended_products = _safe_recommended_products(_coerce_recommended_products(final_state))
     recommendation_source = (final_state.get("tool_result") or {}).get("source")
 
@@ -455,10 +465,13 @@ def chat(
     return ChatResponse(
         conversation_id=request.conversation_id,
         status=final_state.get("status", "active"),
-        response_text=scrub_pii(final_state.get("response_text") or final_state.get("response", "I am here to help.")),
+        response_text=_normalize_user_visible_text(
+            final_state.get("response_text") or final_state.get("response", "I am here to help."),
+            preserve_support_email=final_state.get("action") in {"portal_redirect", "support_contact"},
+        ),
         recommended_products=recommended_products,
         auth_required=False,
-        intent=final_state.get("intent", "unknown"),
+        intent=intent_value,
         confidence=final_state.get("confidence", 0.0),
         handoff_id=final_state.get("handoff_id"),
         metadata={
@@ -607,7 +620,7 @@ def resume_handoff(
                 config={"configurable": {"thread_id": record.conversation_id}},
             )
             resumed_response = scrub_pii(resumed_state.get("response", resumed_response))
-            resumed_intent = resumed_state.get("intent", "general")
+            resumed_intent = _normalize_chat_intent(resumed_state.get("intent", "general"))
             resumed_confidence = resumed_state.get("confidence", 1.0)
         except Exception:
             resumed_response = scrub_pii(request.agent_message)
@@ -625,10 +638,10 @@ def resume_handoff(
     return ChatResponse(
         conversation_id=record.conversation_id,
         status="resolved",
-        response_text=resumed_response,
+        response_text=_normalize_user_visible_text(resumed_response, preserve_support_email=True),
         recommended_products=[],
         auth_required=False,
-        intent=resumed_intent,
+        intent=_normalize_chat_intent(resumed_intent),
         confidence=resumed_confidence,
         handoff_id=handoff_id,
         metadata={"handoff_status": "resolved", "resolution_note": scrub_pii(updated.resolution_note)},
