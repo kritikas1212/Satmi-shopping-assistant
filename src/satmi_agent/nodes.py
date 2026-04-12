@@ -669,8 +669,14 @@ def _enforce_discovery_response_format(*, response: str, recommended_products: l
 
     Rules:
     1) For more than two products, force markdown bullet list formatting.
-    2) Always include an explicit `Next step:` CTA line.
+    2) Never emit banned CTA labels like `next step:`.
+    3) Ensure an allowed CTA phrase is present (for example, "please click").
     """
+    def _sanitize(text: str) -> str:
+        cleaned = re.sub(r"(?i)next\s*step\s*:\s*", "", text or "").strip()
+        cleaned = re.sub(r"(?i)you can continue by", "Please click", cleaned).strip()
+        return cleaned
+
     if len(recommended_products) > 2:
         lines = ["Here are some popular picks from our authentic SATMI catalog:", ""]
         for product in recommended_products[:5]:
@@ -678,16 +684,28 @@ def _enforce_discovery_response_format(*, response: str, recommended_products: l
             price = str(product.get("price") or "INR NA").strip()
             lines.append(f"- **{title}** - {price}")
         lines.append("")
-        lines.append("Next step: Which one matters most to you-price, quality, or fastest delivery?")
+        lines.append("Please click 'Select & Buy' on a product below to proceed, or tell me your budget and preferred size so I can refine this shortlist.")
         return "\n".join(lines)
 
-    lowered = (response or "").lower()
-    if "next step:" not in lowered:
-        base = (response or "").rstrip()
-        suffix = "Next step: Tell me your budget and preferred size, and I'll narrow it down."
+    base = _sanitize(response or "")
+    lowered = base.lower()
+    allowed_cta_markers = (
+        "would you like",
+        "please click",
+        "explore these",
+        "check out",
+        "here are some",
+        "i can help with",
+        "proceed",
+        "selection below",
+        "would you be interested",
+        "allow me to present",
+    )
+    if not any(marker in lowered for marker in allowed_cta_markers):
+        suffix = "Please click 'Select & Buy' on a product below to proceed, or share your budget and preferred size so I can narrow it down."
         return f"{base}\n\n{suffix}" if base else suffix
 
-    return response
+    return base
 
 
 def _record_feedback_event(*, state: AgentState, reason: str, response_text: str) -> None:
@@ -1339,7 +1357,7 @@ def compose_response(state: AgentState) -> AgentState:
         response_source = "comparison_enforcer"
         _record_feedback_event(state=state, reason="comparison_table_enforced_post_fallback", response_text=response)
 
-    if action in {"search_products", "knowledge_and_search"} and recommended_products:
+    if action in {"search_products", "knowledge_and_search"}:
         response = _enforce_discovery_response_format(response=response or "", recommended_products=recommended_products)
         response_source = "discovery_format_enforcer"
 
