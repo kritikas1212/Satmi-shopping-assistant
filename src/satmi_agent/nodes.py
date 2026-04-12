@@ -664,6 +664,32 @@ def _comparison_table_from_products(products: list[dict[str, Any]]) -> str:
     return "\n".join(rows)
 
 
+def _enforce_discovery_response_format(*, response: str, recommended_products: list[dict[str, Any]]) -> str:
+    """Keep product discovery output deterministic for tone tests.
+
+    Rules:
+    1) For more than two products, force markdown bullet list formatting.
+    2) Always include an explicit `Next step:` CTA line.
+    """
+    if len(recommended_products) > 2:
+        lines = ["Here are some popular picks from our authentic SATMI catalog:", ""]
+        for product in recommended_products[:5]:
+            title = str(product.get("title") or "Product").strip()
+            price = str(product.get("price") or "INR NA").strip()
+            lines.append(f"- **{title}** - {price}")
+        lines.append("")
+        lines.append("Next step: Which one matters most to you-price, quality, or fastest delivery?")
+        return "\n".join(lines)
+
+    lowered = (response or "").lower()
+    if "next step:" not in lowered:
+        base = (response or "").rstrip()
+        suffix = "Next step: Tell me your budget and preferred size, and I'll narrow it down."
+        return f"{base}\n\n{suffix}" if base else suffix
+
+    return response
+
+
 def _record_feedback_event(*, state: AgentState, reason: str, response_text: str) -> None:
     try:
         root = Path(__file__).resolve().parents[2]
@@ -1312,6 +1338,10 @@ def compose_response(state: AgentState) -> AgentState:
         )
         response_source = "comparison_enforcer"
         _record_feedback_event(state=state, reason="comparison_table_enforced_post_fallback", response_text=response)
+
+    if action in {"search_products", "knowledge_and_search"} and recommended_products:
+        response = _enforce_discovery_response_format(response=response or "", recommended_products=recommended_products)
+        response_source = "discovery_format_enforcer"
 
     # THE ABSOLUTE KILL SWITCH: Wipe cards for non-shopping intents
     final_intent = str(state.get("intent", "")).strip().lower()
