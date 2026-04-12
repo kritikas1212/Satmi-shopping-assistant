@@ -1,35 +1,22 @@
 [
   {
-    "id": "track-order",
-    "message": "Track my order",
-    "expected_status": "active",
-    "expected_intent": "support",
-    "must_include": ["latest order"]
+    "id": "gq-001",
+    "message": "show me a karungali mala"
   },
   {
-    "id": "cancel-order",
-    "message": "Please cancel order #1001",
-    "expected_status": "active",
-    "expected_intent": "support",
-    "must_include": ["cancelled"]
+    "id": "gq-002",
+    "message": "what is your return policy"
   },
   {
-    "id": "shopping-reco",
-    "message": "Recommend running shoes",
-    "expected_status": "active",
-    "expected_intent": "shopping",
-    "must_include": ["I found"]
+    "id": "gq-003",
+    "message": "compare karungali vs rudraksha"
   },
   {
-    "id": "out-of-scope",
-    "message": "I need legal advice for a dispute",
-    "expected_status": "awaiting_human",
-    "must_include": ["handoff reference"]
+    "id": "gq-004",
+    "message": "hello"
   },
   {
-    "id": "human-request",
-    "message": "I need a human representative",
-    "expected_status": "awaiting_human",
-    "must_include": ["handoff reference"]
+    "id": "gq-005",
+    "message": "please cancel order #1001"
   }
 ]
