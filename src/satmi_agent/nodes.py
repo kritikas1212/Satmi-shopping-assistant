@@ -664,7 +664,41 @@ def _comparison_table_from_products(products: list[dict[str, Any]]) -> str:
     return "\n".join(rows)
 
 
-def _enforce_discovery_response_format(*, response: str, recommended_products: list[dict[str, Any]]) -> str:
+_INTERNAL_LEAK_TERMS = (
+    "catalog items",
+    "relevance matches",
+    "local cache",
+    "search_products",
+    "input_guardrails",
+)
+
+
+def _sanitize_user_visible_response(text: str) -> str:
+    if not text:
+        return ""
+
+    cleaned = text
+    for marker in ("\n_tool_code", "\ntool_code"):
+        if marker in cleaned:
+            cleaned = cleaned.split(marker, 1)[0]
+
+    # Strip common tool-trace style lines that sometimes leak from model output.
+    cleaned = re.sub(r"(?im)^.*call\*\*:.*$", "", cleaned)
+    cleaned = re.sub(r"(?im)^.*\btool\s*call\b.*$", "", cleaned)
+    cleaned = re.sub(r"(?im)^.*\bfunction\s*call\b.*$", "", cleaned)
+
+    # Enforce banned phrase constraints from deterministic tests.
+    cleaned = re.sub(r"(?i)next\s*step\s*:\s*", "", cleaned)
+    cleaned = re.sub(r"(?i)you can continue by", "Please click", cleaned)
+
+    for term in _INTERNAL_LEAK_TERMS:
+        cleaned = re.sub(re.escape(term), "", cleaned, flags=re.IGNORECASE)
+
+    cleaned_lines = [line.rstrip() for line in cleaned.splitlines() if line.strip()]
+    return "\n".join(cleaned_lines).strip()
+
+
+def _enforce_discovery_response_format(*, response: str, recommended_products: list[dict[str, Any]], source_results: list[dict[str, Any]] | None = None) -> str:
     """Keep product discovery output deterministic for tone tests.
 
     Rules:
@@ -672,14 +706,22 @@ def _enforce_discovery_response_format(*, response: str, recommended_products: l
     2) Never emit banned CTA labels like `next step:`.
     3) Ensure an allowed CTA phrase is present (for example, "please click").
     """
-    def _sanitize(text: str) -> str:
-        cleaned = re.sub(r"(?i)next\s*step\s*:\s*", "", text or "").strip()
-        cleaned = re.sub(r"(?i)you can continue by", "Please click", cleaned).strip()
-        return cleaned
+    display_products = list(recommended_products or [])
+    if not display_products and source_results:
+        for item in source_results[:8]:
+            title = str(item.get("title") or item.get("name") or "").strip()
+            if not title:
+                continue
+            display_products.append(
+                {
+                    "title": title,
+                    "price": str(item.get("price") or "INR NA").strip(),
+                }
+            )
 
-    if len(recommended_products) > 2:
+    if len(display_products) > 2:
         lines = ["Here are some popular picks from our authentic SATMI catalog:", ""]
-        for product in recommended_products[:5]:
+        for product in display_products[:5]:
             title = str(product.get("title") or "Product").strip()
             price = str(product.get("price") or "INR NA").strip()
             lines.append(f"- **{title}** - {price}")
@@ -687,7 +729,7 @@ def _enforce_discovery_response_format(*, response: str, recommended_products: l
         lines.append("Please click 'Select & Buy' on a product below to proceed, or tell me your budget and preferred size so I can refine this shortlist.")
         return "\n".join(lines)
 
-    base = _sanitize(response or "")
+    base = _sanitize_user_visible_response(response or "")
     lowered = base.lower()
     allowed_cta_markers = (
         "would you like",
@@ -1358,8 +1400,14 @@ def compose_response(state: AgentState) -> AgentState:
         _record_feedback_event(state=state, reason="comparison_table_enforced_post_fallback", response_text=response)
 
     if action in {"search_products", "knowledge_and_search"}:
-        response = _enforce_discovery_response_format(response=response or "", recommended_products=recommended_products)
+        response = _enforce_discovery_response_format(
+            response=response or "",
+            recommended_products=recommended_products,
+            source_results=(tool_result.get("results") or []),
+        )
         response_source = "discovery_format_enforcer"
+
+    response = _sanitize_user_visible_response(response or "")
 
     # THE ABSOLUTE KILL SWITCH: Wipe cards for non-shopping intents
     final_intent = str(state.get("intent", "")).strip().lower()
