@@ -5,7 +5,7 @@ class Settings(BaseSettings):
     app_env: str = "dev"
     api_port: int = 8000
     llm_provider: str = "gemini"
-    model_name: str = "gemini-2.0-flash"
+    model_name: str = "gemini-2.5-flash"
     gemini_api_key: str | None = None
     gemini_retry_count: int = 2
     gemini_strict_retry_count: int = 1

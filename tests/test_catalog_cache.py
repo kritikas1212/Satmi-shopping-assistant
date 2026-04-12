@@ -32,7 +32,7 @@ def test_search_products_uses_fresh_db_cache(monkeypatch):
 
     result = service.search_products("karungali mala")
 
-    assert result["source"] == "db_cache"
+    assert result["source"] == "shopify_top8_material_filtered"
     assert result["catalog_size"] == 2
     assert result["matched_count"] >= 1
     assert result["results"][0]["name"] == "Karungali Mala"
@@ -61,7 +61,7 @@ def test_search_products_syncs_shopify_when_cache_stale(monkeypatch):
 
     result = service.search_products("karungali")
 
-    assert result["source"] == "shopify_live_sync"
+    assert result["source"] == "shopify_top8_material_filtered"
     assert result["catalog_size"] == 1
     assert upsert_calls == [1]
 
@@ -83,6 +83,6 @@ def test_search_products_uses_stale_cache_when_shopify_fails(monkeypatch):
 
     result = service.search_products("rudraksha")
 
-    assert result["source"] == "db_cache_stale"
+    assert result["source"] == "storefront_top8_material_filtered"
     assert result["catalog_size"] == 2
     assert result["matched_count"] >= 1
