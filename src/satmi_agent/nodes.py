@@ -605,19 +605,19 @@ def _deterministic_grounded_fallback(*, state: AgentState, policy_context: list[
         first_title = str(product_snippets[0].get("title") or "these options").strip()
         return (
             f"I found grounded options that match \"{user_message}\". "
-            f"Start with {first_title}, and I can narrow by budget, material, or purpose in the next step."
+            f"Start with {first_title}, and I can narrow by budget, material, or purpose in the next step. Would you like to explore these options?"
         )
 
     if policy_context:
         first_topic = str(policy_context[0].get("title") or "policy guidance").strip()
         return (
             f"Based on available SATMI guidance, this maps to {first_topic}. "
-            "If you want, I can provide a concise checklist for what to do next."
+            "If you want, I can provide a concise checklist for what to do next. You can continue by asking for the checklist."
         )
 
     return (
         f"I can help with \"{user_message}\" right away. "
-        f"{next_step_guidance}"
+        f"{next_step_guidance} Would you like to proceed?"
     )
 
 
@@ -719,7 +719,7 @@ def classify_intent(state: AgentState) -> AgentState:
             classification_source = "llm"
         else:
             intent = "general"
-            confidence = 0.0
+            confidence = 0.5
             classification_source = "fallback"
 
     requested_human = _requested_human_assistance(message, words)
@@ -1106,7 +1106,7 @@ def execute_action(state: AgentState) -> AgentState:
             ],
         }
 
-    action = "search_products"
+    action = "knowledge_and_search" if _is_knowledge_query(message) else "search_products"
     clean_query = "Karungali Rudraksha Rose Quartz" if _is_best_sellers_query(message, _tokenize(message)) else _extract_search_query(message)
     tool_result = tooling_service.search_products(clean_query)
     tool_result["effective_query"] = clean_query

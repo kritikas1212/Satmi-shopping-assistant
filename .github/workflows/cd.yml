@@ -23,110 +23,41 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       image_uri: ${{ steps.compute-image.outputs.image_uri }}
-#     steps:
-#       - name: Checkout
-#         uses: actions/checkout@v4
-#
-#       - name: Prepare image repo
-#         id: prep
-#         run: echo "image_repo=${REGISTRY}/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
-#
-#       - name: Log in to GHCR
-#         uses: docker/login-action@v3
-#         with:
-#           registry: ${{ env.REGISTRY }}
-#           username: ${{ github.actor }}
-#           password: ${{ secrets.GITHUB_TOKEN }}
-#
-#       - name: Generate image metadata
-#         id: meta
-#         uses: docker/metadata-action@v5
-#         with:
-#           images: ${{ steps.prep.outputs.image_repo }}
-#           tags: |
-#             type=sha,format=long,prefix=
-#             type=raw,value=latest,enable={{is_default_branch}}
-#
-#       - name: Build and push image
-#         uses: docker/build-push-action@v6
-#         with:
-#           context: .
-#           push: true
-#           tags: ${{ steps.meta.outputs.tags }}
-#           labels: ${{ steps.meta.outputs.labels }}
-#
-#       - name: Compute deploy image
-#         id: compute-image
-#         run: |
-#           image_repo="${{ steps.prep.outputs.image_repo }}"
-#           image_tag="${GITHUB_SHA}"
-#           echo "image_uri=${image_repo}:${image_tag}" >> "$GITHUB_OUTPUT"
-#
-#   # deploy:
-#   #   runs-on: ubuntu-latest
-#   #   needs: build-and-push
-#   #   if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
-#   #   environment: production
-#   #   concurrency:
-#   #     group: satmi-production-deploy
-#   #     cancel-in-progress: false
-#   #   env:
-#   #     K8S_NAMESPACE: satmi
-#   #     K8S_DEPLOYMENT: satmi-app
-#   #     K8S_CONTAINER: satmi-app
-#   #     K8S_WORKER_DEPLOYMENT: satmi-cancel-worker
-#   #     K8S_WORKER_CONTAINER: satmi-cancel-worker
-#     steps:
-#       - name: Checkout
-#         uses: actions/checkout@v4
-#
-#       - name: Configure kubeconfig
-#         env:
-#           KUBE_CONFIG_BASE64: ${{ secrets.KUBE_CONFIG_BASE64 }}
-#         run: |
-#           mkdir -p "$HOME/.kube"
-#           echo "$KUBE_CONFIG_BASE64" | base64 --decode > "$HOME/.kube/config"
-#           chmod 600 "$HOME/.kube/config"
-#
-#       - name: Install kubectl
-#         uses: azure/setup-kubectl@v4
-#
-#       - name: Apply app secret
-#         env:
-#           SATMI_APP_SECRET_YAML_BASE64: ${{ secrets.SATMI_APP_SECRET_YAML_BASE64 }}
-#         run: |
-#           echo "$SATMI_APP_SECRET_YAML_BASE64" | base64 --decode | kubectl apply -f -
-#
-#       - name: Apply Kubernetes manifests
-#         run: kubectl apply -k k8s/base
-#
-#       - name: Set release image and rollout
-#         env:
-#           IMAGE_URI: ${{ needs.build-and-push.outputs.image_uri }}
-#         run: |
-#           kubectl -n "$K8S_NAMESPACE" set image deployment/"$K8S_DEPLOYMENT" "$K8S_CONTAINER"="$IMAGE_URI"
-#           kubectl -n "$K8S_NAMESPACE" set image deployment/"$K8S_WORKER_DEPLOYMENT" "$K8S_WORKER_CONTAINER"="$IMAGE_URI"
-#           kubectl -n "$K8S_NAMESPACE" rollout status deployment/"$K8S_DEPLOYMENT" --timeout=180s
-#           kubectl -n "$K8S_NAMESPACE" rollout status deployment/"$K8S_WORKER_DEPLOYMENT" --timeout=180s
-#
-#       - name: Post-deploy smoke check
-#         env:
-#           DEPLOY_SMOKE_URL: ${{ secrets.DEPLOY_SMOKE_URL }}
-#           DEPLOY_SMOKE_API_KEY: ${{ secrets.DEPLOY_SMOKE_API_KEY }}
-#         run: |
-#           if [ -z "$DEPLOY_SMOKE_URL" ]; then
-#             echo "DEPLOY_SMOKE_URL not set; skipping smoke check"
-#             exit 0
-#           fi
-#
-#           if [ -n "$DEPLOY_SMOKE_API_KEY" ]; then
-#             curl --fail --show-error --silent -H "X-API-Key: $DEPLOY_SMOKE_API_KEY" "$DEPLOY_SMOKE_URL"
-#           else
-#             curl --fail --show-error --silent "$DEPLOY_SMOKE_URL"
-#           fi
-#
-#       - name: Roll back on deploy failure
-#         if: failure()
-#         run: |
-#           kubectl -n "$K8S_NAMESPACE" rollout undo deployment/"$K8S_DEPLOYMENT"
-#           kubectl -n "$K8S_NAMESPACE" rollout status deployment/"$K8S_DEPLOYMENT" --timeout=180s
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare image repo
+        id: prep
+        run: echo "image_repo=${REGISTRY}/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.prep.outputs.image_repo }}
+          tags: |
+            type=sha,format=long,prefix=
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Compute deploy image
+        id: compute-image
+        run: |
+          image_repo="${{ steps.prep.outputs.image_repo }}"
+          image_tag="${GITHUB_SHA}"
+          echo "image_uri=${image_repo}:${image_tag}" >> "$GITHUB_OUTPUT"

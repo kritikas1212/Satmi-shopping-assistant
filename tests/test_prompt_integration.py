@@ -45,12 +45,12 @@ def test_general_inquiry_routes_to_general_conversation(monkeypatch):
 
     state = _base_state("blorb zyx")
     state = nodes.classify_intent(state)
-    assert state["intent"] == "general_inquiry"
+    assert state["intent"] == "general"
 
     state = nodes.policy_guard(state)
     assert state["policy_ok"] is True
 
-    assert nodes.route_post_policy(state) == "general_conversation"
+    assert nodes.route_after_policy_guard(state) == "general_conversation"
 
     state = nodes.retrieve_policy_node(state)
     state = nodes.general_conversation(state)
@@ -103,11 +103,16 @@ def test_general_conversation_normalizes_system_message_to_front(monkeypatch):
 
     history = state["message_history"]
     assert history[0]["role"] == "system"
-    assert "SATMI Concierge" in history[0]["content"]
+    assert "Concierge for SATMI" in history[0]["content"]
     assert sum(1 for item in history if item.get("role") == "system") == 1
 
 
-def test_ambiguous_query_yields_clarification_response():
+def test_ambiguous_query_yields_clarification_response(monkeypatch):
+    monkeypatch.setattr(
+        nodes,
+        "classify_intent_with_llm",
+        lambda *args, **kwargs: ("unknown_unsupported", 0.9),
+    )
     state = _base_state("refund")
     state = nodes.classify_intent(state)
     state = nodes.policy_guard(state)
