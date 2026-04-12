@@ -13,6 +13,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from satmi_agent.main import app
+from satmi_agent.persistence import persistence_service
 
 
 def evaluate_case(client: TestClient, case: dict) -> tuple[bool, str]:
@@ -54,17 +55,21 @@ def main() -> int:
     args = parser.parse_args()
 
     dataset_path = Path(args.dataset)
-    cases = json.loads(dataset_path.read_text(encoding="utf-8"))
+    if not dataset_path.exists():
+        print(f"Golden set file not found: {dataset_path}")
+        return 1
 
-    client = TestClient(app)
+    cases = json.loads(dataset_path.read_text(encoding="utf-8"))
+    persistence_service.init_db()
     passed = 0
 
-    for case in cases:
-        ok, reason = evaluate_case(client, case)
-        status = "PASS" if ok else "FAIL"
-        print(f"[{status}] {case['id']}: {reason}")
-        if ok:
-            passed += 1
+    with TestClient(app) as client:
+        for case in cases:
+            ok, reason = evaluate_case(client, case)
+            status = "PASS" if ok else "FAIL"
+            print(f"[{status}] {case['id']}: {reason}")
+            if ok:
+                passed += 1
 
     total = len(cases)
     pass_rate = (passed / total) if total else 0.0
