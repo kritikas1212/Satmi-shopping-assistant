@@ -303,7 +303,7 @@ export default function SatmiChat() {
       )}
 
       {isOpen && (
-        <div className="satmi-widget-window bg-[#F9F6F2]">
+        <div className="satmi-widget-window bg-[#F9F6F2] flex flex-col">
           <header className="flex items-center justify-between border-b border-[#E6D8C9] bg-[#F9F6F2] px-5 py-4">
             <div>
               <img src="/logo.png" alt="SATMI Logo" className="h-6 w-auto mb-1" />
@@ -321,14 +321,15 @@ export default function SatmiChat() {
               <button
                 type="button"
                 onClick={handleCloseChat}
-                className="rounded-lg border border-[#7A1E1E] px-2.5 py-1 text-xs font-medium text-[#7A1E1E] hover:bg-[#EFE7DE]"
+                className="inline-flex h-7 w-7 items-center justify-center rounded-lg border border-[#7A1E1E] text-sm font-semibold text-[#7A1E1E] hover:bg-[#EFE7DE]"
+                aria-label="Close chat"
               >
-                Close
+                ×
               </button>
             </div>
           </header>
 
-          <div ref={scrollRef} className="h-[calc(100%-148px)] space-y-4 overflow-y-auto bg-[#F9F6F2] px-4 py-4">
+          <div ref={scrollRef} className="flex-1 min-h-0 space-y-4 overflow-y-auto bg-[#F9F6F2] px-4 py-4">
             {messages.map((message, index) => (
               <div key={message.id} className={`max-w-[92%] ${message.role === "user" ? "ml-auto" : ""}`}>
                 <ChatBubble
