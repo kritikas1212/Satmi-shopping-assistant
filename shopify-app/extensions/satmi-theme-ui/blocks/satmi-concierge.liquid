@@ -1,0 +1,75 @@
+{% liquid
+  assign satmi_url = block.settings.nextjs_url | strip
+  if satmi_url == blank
+    assign satmi_url = 'https://satmi-shopping-assistant.vercel.app'
+  endif
+%}
+
+<iframe
+  id="satmi-chat-iframe"
+  src="{{ satmi_url }}"
+  title="SATMI AI Concierge"
+  loading="lazy"
+  allow="clipboard-write"
+></iframe>
+
+<style>
+  #satmi-chat-iframe {
+    position: fixed;
+    right: 20px;
+    bottom: 50px;
+    width: 80px;
+    height: 80px;
+    border: 0;
+    border-radius: 16px;
+    background: transparent;
+    z-index: 9999;
+    transition: all 0.3s ease;
+    overflow: hidden;
+  }
+
+  #satmi-chat-iframe.is-open {
+    width: 400px;
+    height: 750px;
+    border-radius: 16px;
+  }
+
+  @media (max-width: 768px) {
+    #satmi-chat-iframe.is-open {
+      right: 10px;
+      bottom: 50px;
+      width: calc(100vw - 20px);
+      height: calc(100vh - 70px);
+      border-radius: 14px;
+    }
+  }
+</style>
+
+<script>
+  window.addEventListener('message', function(event) {
+    if (event.data && event.data.type === 'SATMI_CHAT_TOGGLE') {
+      var iframe = document.getElementById('satmi-chat-iframe');
+      if (!iframe) return;
+      if (event.data.isOpen) {
+        iframe.classList.add('is-open');
+      } else {
+        iframe.classList.remove('is-open');
+      }
+    }
+  });
+</script>
+
+{% schema %}
+{
+  "name": "SATMI AI Concierge",
+  "target": "body",
+  "settings": [
+    {
+      "type": "url",
+      "id": "nextjs_url",
+      "label": "Next.js App URL",
+      "default": "https://satmi-shopping-assistant.vercel.app"
+    }
+  ]
+}
+{% endschema %}
