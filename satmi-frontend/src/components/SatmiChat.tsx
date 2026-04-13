@@ -80,6 +80,16 @@ export default function SatmiChat() {
   const scrollRef = useRef<HTMLDivElement>(null);
   const userId = useMemo(() => `web-${conversationId || "guest"}`, [conversationId]);
 
+  const handleOpenChat = () => {
+    setIsOpen(true);
+    window.parent.postMessage({ type: 'SATMI_CHAT_TOGGLE', isOpen: true }, '*');
+  };
+
+  const handleCloseChat = () => {
+    setIsOpen(false);
+    window.parent.postMessage({ type: 'SATMI_CHAT_TOGGLE', isOpen: false }, '*');
+  };
+
   useEffect(() => {
     const savedConversationId = localStorage.getItem(STORAGE_KEYS.conversationId);
     const savedMessages = parseMessages(localStorage.getItem(STORAGE_KEYS.messages));
@@ -94,6 +104,10 @@ export default function SatmiChat() {
     localStorage.setItem(STORAGE_KEYS.messages, JSON.stringify(nextMessages));
 
     setHydrated(true);
+  }, []);
+
+  useEffect(() => {
+    window.parent.postMessage({ type: 'SATMI_CHAT_TOGGLE', isOpen: false }, '*');
   }, []);
 
   useEffect(() => {
@@ -259,7 +273,7 @@ export default function SatmiChat() {
       {!isOpen && (
         <button
           type="button"
-          onClick={() => setIsOpen(true)}
+          onClick={handleOpenChat}
           className="satmi-widget-fab"
           aria-label="Open SATMI Chat"
         >
@@ -284,7 +298,7 @@ export default function SatmiChat() {
             </div>
             <button
               type="button"
-              onClick={() => setIsOpen(false)}
+              onClick={handleCloseChat}
               className="rounded-lg border border-[#7A1E1E] px-2.5 py-1 text-xs font-medium text-[#7A1E1E] hover:bg-[#EFE7DE]"
             >
               Close
