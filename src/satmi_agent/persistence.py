@@ -93,7 +93,16 @@ class ProductCatalogRecord(Base):
     synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
 
 
-engine = create_engine(settings.database_url, future=True)
+def _normalize_database_url(url: str) -> str:
+    normalized = (url or "").strip()
+    if normalized.startswith("postgres://"):
+        normalized = "postgresql://" + normalized[len("postgres://"):]
+    if normalized.startswith("postgresql://") and "+" not in normalized.split("://", 1)[0]:
+        normalized = "postgresql+psycopg://" + normalized[len("postgresql://"):]
+    return normalized
+
+
+engine = create_engine(_normalize_database_url(settings.database_url), future=True)
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False, autoflush=False, future=True)
 
 
