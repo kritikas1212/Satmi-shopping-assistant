@@ -51,6 +51,7 @@
     if (!iframe) return;
 
     var BASE_BOTTOM = 50;
+    var MOBILE_EXTRA_OFFSET = 60;
     var STICKY_OFFSET = 80;
     var mobileQuery = window.matchMedia('(max-width: 768px)');
     var stickySelectors = [
@@ -87,7 +88,8 @@
         return;
       }
 
-      var nextBottom = isStickyAtcVisible() ? BASE_BOTTOM + STICKY_OFFSET : BASE_BOTTOM;
+      var mobileBaseBottom = BASE_BOTTOM + MOBILE_EXTRA_OFFSET;
+      var nextBottom = isStickyAtcVisible() ? mobileBaseBottom + STICKY_OFFSET : mobileBaseBottom;
       iframe.style.bottom = nextBottom + 'px';
     }
 
