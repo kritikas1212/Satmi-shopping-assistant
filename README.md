@@ -1,14 +1,3 @@
-*for server startup
-cd /Users/kritikasingh/Downloads/Satmi-Chatbot
-source .venv/bin/activate
-PYTHONPATH=src uvicorn satmi_agent.main:app --host 0.0.0.0 --port 8000 2>&1 | tee backend.log
-
-*startup with database
-DATABASE_URL=sqlite:///./satmi_agent.db PYTHONPATH=src uvicorn satmi_agent.main:app --host 0.0.0.0 --port 8000 2>&1 | tee backend.log
-
-If you already have a `.env` file that points `DATABASE_URL` at PostgreSQL, this command overrides it for local SQLite startup.
-
-
 # SATMI Chatbot (LangGraph + LangChain)
 
 Production-oriented starter for a SATMI customer support + shopping assistant with mandatory human handoff when requests are out of scope.
@@ -140,16 +129,6 @@ pip install -r requirements.txt
 export PYTHONPATH=src
 uvicorn satmi_agent.main:app --reload --port 8000
 ```
-
-Contributor safety notes (SSH auth + pre-commit secret scanning) are in `CONTRIBUTING.md`.
-
-One-shot startup (preflight + Firebase JSON validation + API/worker + diagnostics):
-
-```bash
-./scripts/start_local_stack.sh
-```
-
-This script reads `.env`, checks required settings, validates `FIREBASE_CREDENTIALS_PATH` JSON when Firebase auth is enabled, starts both API and worker, then runs `/health`, `/system/healthz/deps`, `/system/config`, and a `/chat` smoke request automatically.
 
 Set database for dev/prod:
 

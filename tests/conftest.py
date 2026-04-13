@@ -25,8 +25,6 @@ def reset_runtime_settings():
         "tracing_enabled": settings.tracing_enabled,
         "hitl_interrupt_enabled": settings.hitl_interrupt_enabled,
         "async_cancel_enabled": settings.async_cancel_enabled,
-        "firebase_auth_enabled": settings.firebase_auth_enabled,
-        "firebase_require_for_sensitive_actions": settings.firebase_require_for_sensitive_actions,
     }
 
     settings.auth_required = False
@@ -37,8 +35,6 @@ def reset_runtime_settings():
     settings.tracing_enabled = False
     settings.hitl_interrupt_enabled = False
     settings.async_cancel_enabled = False
-    settings.firebase_auth_enabled = False
-    settings.firebase_require_for_sensitive_actions = False
     rate_limiter._counters.clear()
 
     yield
@@ -51,6 +47,4 @@ def reset_runtime_settings():
     settings.tracing_enabled = original["tracing_enabled"]
     settings.hitl_interrupt_enabled = original["hitl_interrupt_enabled"]
     settings.async_cancel_enabled = original["async_cancel_enabled"]
-    settings.firebase_auth_enabled = original["firebase_auth_enabled"]
-    settings.firebase_require_for_sensitive_actions = original["firebase_require_for_sensitive_actions"]
     rate_limiter._counters.clear()

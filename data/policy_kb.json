@@ -14,20 +14,6 @@
     "content": "Approved refunds are typically processed to the original payment method within 5-7 business days."
   },
   {
-    "id": "portal_actions",
-    "intent": "support",
-    "tags": ["cancel", "cancellation", "address", "replacement", "replace", "update", "order"],
-    "title": "Account portal actions",
-    "content": "Order cancellation, address updates, and replacement requests must be completed through https://accounts.satmi.in."
-  },
-  {
-    "id": "support_contact",
-    "intent": "support",
-    "tags": ["contact", "whatsapp", "call", "phone", "email", "support"],
-    "title": "Support contact details",
-    "content": "Please contact support@satmi.in. The support team responds within 24 hours."
-  },
-  {
     "id": "shipping_updates",
     "intent": "support",
     "tags": ["track", "shipment", "delivery", "carrier"],

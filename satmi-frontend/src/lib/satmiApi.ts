@@ -19,10 +19,11 @@ export type ChatMetadata = {
 export type ChatResponse = {
   conversation_id: string;
   status: "active" | "awaiting_human" | "resolved";
-  response_text: string;
-  auth_required: boolean;
+  response?: string;
+  response_text?: string;
+  auth_required?: boolean;
   recommended_products?: ProductRecommendation[];
-  intent: "shopping" | "order_tracking" | "policy_brand_faq" | "general" | "authentication" | "unknown";
+  intent: string;
   confidence: number;
   handoff_id?: string | null;
   metadata?: ChatMetadata;

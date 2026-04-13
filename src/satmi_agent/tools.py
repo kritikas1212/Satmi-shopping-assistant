@@ -209,6 +209,7 @@ class ToolingService:
             "rudraksha",
             "karungali",
             "crystal",
+            "pyrite",
             "rose",
             "quartz",
             "tulsi",

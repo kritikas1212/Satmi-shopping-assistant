@@ -159,6 +159,12 @@ def _post_gemini_json(
 
 def _sanitize_user_facing_text(text: str) -> str:
     cleaned = _INTERNAL_LABEL_PATTERN.sub("", text or "")
+    # Remove leaked internal tool snippets if model emits pseudo-code.
+    cleaned = re.sub(r"```(?:json|python)?\s*\{\s*\"tool_code\".*?\}\s*```", "", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    cleaned = re.sub(r"\{\s*\"tool_code\"\s*:\s*\".*?\"\s*\}", "", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    cleaned = re.sub(r"(?im)^.*search_products\(query=.*$", "", cleaned)
+    cleaned = re.sub(r"(?im)^.*tool_code.*$", "", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     cleaned = cleaned.strip()
     if cleaned.startswith("{") and cleaned.endswith("}"):
         return "I can help with that. Tell me what outcome you want, and I will guide you step by step."

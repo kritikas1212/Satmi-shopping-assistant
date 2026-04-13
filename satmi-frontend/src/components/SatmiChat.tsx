@@ -202,7 +202,7 @@ export default function SatmiChat() {
 
     appendMessage(
       "assistant",
-      response.response_text || response.reply || "I am here to help.",
+      response.response || response.response_text || response.reply || "I am here to help.",
       response.recommended_products || []
     );
 

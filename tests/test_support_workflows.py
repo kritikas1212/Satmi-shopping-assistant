@@ -7,7 +7,6 @@ from fastapi.testclient import TestClient
 from satmi_agent.config import settings
 from satmi_agent.main import app
 import satmi_agent.main as main_module
-from satmi_agent.nodes import compose_response, execute_action
 
 
 def _auth_headers(role: str | None = None) -> dict[str, str]:
@@ -119,47 +118,3 @@ def test_conversation_events_require_support_role(monkeypatch) -> None:
         assert allowed.status_code == 200
         events = allowed.json()
         assert len(events) >= 2
-
-
-def test_portal_bound_requests_redirect_to_accounts() -> None:
-    state = {
-        "intent": "general",
-        "message": "I need to update my address and request a replacement",
-        "conversation_id": "thread-portal",
-        "user_id": "cust-portal",
-        "message_history": [],
-        "internal_logs": [],
-        "policy_context": [],
-    }
-
-    action_state = execute_action(state)
-
-    assert action_state["action"] == "portal_redirect"
-
-    composed_state = compose_response(action_state)
-    response_text = composed_state["response_text"]
-    assert "accounts.satmi.in" in response_text
-    assert "support@satmi.in" in response_text
-    assert "within 24 hours" in response_text
-
-
-def test_contact_requests_surface_support_email_and_sla() -> None:
-    state = {
-        "intent": "general",
-        "message": "Please contact me on WhatsApp or send me a number",
-        "conversation_id": "thread-contact",
-        "user_id": "cust-contact",
-        "message_history": [],
-        "internal_logs": [],
-        "policy_context": [],
-    }
-
-    action_state = execute_action(state)
-
-    assert action_state["action"] == "support_contact"
-
-    composed_state = compose_response(action_state)
-    response_text = composed_state["response_text"]
-    assert "support@satmi.in" in response_text
-    assert "within 24 hours" in response_text
-    assert "accounts.satmi.in" in response_text

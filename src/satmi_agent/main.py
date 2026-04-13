@@ -104,7 +104,7 @@ def _cors_allow_origins() -> list[str]:
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_allow_origins(),
-    allow_origin_regex=r"https://([a-zA-Z0-9-]+\.)?(myshopify\.com|shopify\.com)$",
+    allow_origin_regex=r"https?://(([a-zA-Z0-9-]+\.)?(myshopify\.com|shopify\.com)|localhost|127\.0\.0\.1|192\.168\.\d+\.\d+)(:\d+)?$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
