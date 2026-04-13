@@ -398,9 +398,6 @@ export default function SatmiChat() {
               </button>
             </div>
 
-            <p className="mt-2 text-[10px] text-[#000000]">
-              conversation_id: {conversationId}
-            </p>
           </form>
         </div>
       )}
