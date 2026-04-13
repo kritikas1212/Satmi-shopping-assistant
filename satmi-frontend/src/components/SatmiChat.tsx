@@ -90,6 +90,19 @@ export default function SatmiChat() {
     window.parent.postMessage({ type: 'SATMI_CHAT_TOGGLE', isOpen: false }, '*');
   };
 
+  const handleNewChat = () => {
+    const nextConversationId = uuidv4();
+    const nextMessages = [createWelcomeMessage()];
+    setConversationId(nextConversationId);
+    setMessages(nextMessages);
+    setDraft("");
+    setErrorMessage(null);
+    setIsPollingTask(false);
+    setActiveTaskId(null);
+    localStorage.setItem(STORAGE_KEYS.conversationId, nextConversationId);
+    localStorage.setItem(STORAGE_KEYS.messages, JSON.stringify(nextMessages));
+  };
+
   useEffect(() => {
     const savedConversationId = localStorage.getItem(STORAGE_KEYS.conversationId);
     const savedMessages = parseMessages(localStorage.getItem(STORAGE_KEYS.messages));
@@ -296,13 +309,23 @@ export default function SatmiChat() {
               <img src="/logo.png" alt="SATMI Logo" className="h-6 w-auto mb-1" />
               <h2 className="text-xl font-semibold text-[#000000] [font-family:var(--font-serif-display)]">Luxury Spiritual Shopping</h2>
             </div>
-            <button
-              type="button"
-              onClick={handleCloseChat}
-              className="rounded-lg border border-[#7A1E1E] px-2.5 py-1 text-xs font-medium text-[#7A1E1E] hover:bg-[#EFE7DE]"
-            >
-              Close
-            </button>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={handleNewChat}
+                disabled={isSending || isPollingTask}
+                className="rounded-lg border border-[#D7C5B5] px-2.5 py-1 text-xs font-medium text-[#7A1E1E] hover:bg-[#EFE7DE] disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                New Chat
+              </button>
+              <button
+                type="button"
+                onClick={handleCloseChat}
+                className="rounded-lg border border-[#7A1E1E] px-2.5 py-1 text-xs font-medium text-[#7A1E1E] hover:bg-[#EFE7DE]"
+              >
+                Close
+              </button>
+            </div>
           </header>
 
           <div ref={scrollRef} className="h-[calc(100%-148px)] space-y-4 overflow-y-auto bg-[#F9F6F2] px-4 py-4">

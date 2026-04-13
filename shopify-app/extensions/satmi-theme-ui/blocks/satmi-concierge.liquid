@@ -46,17 +46,73 @@
 </style>
 
 <script>
-  window.addEventListener('message', function(event) {
-    if (event.data && event.data.type === 'SATMI_CHAT_TOGGLE') {
-      var iframe = document.getElementById('satmi-chat-iframe');
-      if (!iframe) return;
-      if (event.data.isOpen) {
-        iframe.classList.add('is-open');
-      } else {
-        iframe.classList.remove('is-open');
+  (function() {
+    var iframe = document.getElementById('satmi-chat-iframe');
+    if (!iframe) return;
+
+    var BASE_BOTTOM = 50;
+    var STICKY_OFFSET = 50;
+    var mobileQuery = window.matchMedia('(max-width: 768px)');
+    var stickySelectors = [
+      '.sticky-atc',
+      '.sticky-add-to-cart',
+      '.product-sticky-atc',
+      '.product-form__buttons--sticky',
+      '[data-sticky-atc]',
+      '[data-sticky-add-to-cart]'
+    ];
+
+    function isStickyAtcVisible() {
+      var elements = document.querySelectorAll(stickySelectors.join(','));
+      for (var i = 0; i < elements.length; i += 1) {
+        var node = elements[i];
+        if (!(node instanceof HTMLElement)) continue;
+        var style = window.getComputedStyle(node);
+        if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) continue;
+
+        var rect = node.getBoundingClientRect();
+        if (rect.width < 20 || rect.height < 20) continue;
+
+        var touchesBottom = rect.top < window.innerHeight && rect.bottom > window.innerHeight - rect.height;
+        if (touchesBottom) {
+          return true;
+        }
       }
+      return false;
     }
-  });
+
+    function syncIframeBottomOffset() {
+      if (!mobileQuery.matches) {
+        iframe.style.bottom = BASE_BOTTOM + 'px';
+        return;
+      }
+
+      var nextBottom = isStickyAtcVisible() ? BASE_BOTTOM + STICKY_OFFSET : BASE_BOTTOM;
+      iframe.style.bottom = nextBottom + 'px';
+    }
+
+    window.addEventListener('message', function(event) {
+      if (event.data && event.data.type === 'SATMI_CHAT_TOGGLE') {
+        if (event.data.isOpen) {
+          iframe.classList.add('is-open');
+        } else {
+          iframe.classList.remove('is-open');
+        }
+        syncIframeBottomOffset();
+      }
+    });
+
+    var observer = new MutationObserver(syncIframeBottomOffset);
+    if (document.body) {
+      observer.observe(document.body, { childList: true, subtree: true, attributes: true });
+    }
+
+    window.addEventListener('resize', syncIframeBottomOffset, { passive: true });
+    window.addEventListener('scroll', syncIframeBottomOffset, { passive: true });
+    window.addEventListener('orientationchange', syncIframeBottomOffset, { passive: true });
+
+    syncIframeBottomOffset();
+  })();
 </script>
 
 {% schema %}
@@ -67,8 +123,7 @@
     {
       "type": "url",
       "id": "nextjs_url",
-      "label": "Next.js App URL",
-      "default": "https://satmi-shopping-assistant.vercel.app"
+      "label": "Next.js App URL"
     }
   ]
 }
