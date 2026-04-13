@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
+import hashlib
 from typing import Any, Literal
 
 from sqlalchemy import JSON, Boolean, Date, DateTime, Float, Integer, String, Text, create_engine, func, select
@@ -653,6 +654,48 @@ class PersistenceService:
             },
         ]
         return insights
+
+    def list_admin_chat_history(
+        self,
+        *,
+        days: int = 30,
+        limit: int = 100,
+        offset: int = 0,
+        user_id_hash: str | None = None,
+    ) -> list[dict[str, Any]]:
+        cutoff_time = datetime.now(timezone.utc) - timedelta(days=max(days, 1))
+        raw_limit = max(limit + offset, 1)
+        raw_limit = min(raw_limit * 5, 5000)
+
+        with self._session() as session:
+            stmt = (
+                select(ConversationEventRecord)
+                .where(ConversationEventRecord.created_at >= cutoff_time)
+                .where(ConversationEventRecord.role.in_(["user", "assistant", "system"]))
+                .order_by(ConversationEventRecord.created_at.desc())
+                .limit(raw_limit)
+            )
+            rows = list(session.scalars(stmt).all())
+
+        normalized: list[dict[str, Any]] = []
+        for row in rows:
+            uid_hash = hashlib.sha256((row.user_id or "unknown").encode("utf-8")).hexdigest()[:32]
+            if user_id_hash and uid_hash != user_id_hash:
+                continue
+            normalized.append(
+                {
+                    "conversation_id": row.conversation_id,
+                    "user_id_hash": uid_hash,
+                    "role": row.role,
+                    "message": row.message,
+                    "status": row.status,
+                    "intent": row.intent,
+                    "created_at": row.created_at.isoformat(),
+                }
+            )
+
+        paged = normalized[offset : offset + max(limit, 1)]
+        return paged
 
 
 persistence_service = PersistenceService()

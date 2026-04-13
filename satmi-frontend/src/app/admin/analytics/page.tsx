@@ -2,6 +2,8 @@
 
 import { useEffect, useMemo, useState } from "react";
 import {
+  AdminChatHistoryEvent,
+  getAdminChatHistory,
   getAdminIntentTrends,
   getAdminSearchTermTrends,
   getAdminTopSearchTerms,
@@ -24,13 +26,16 @@ function formatDate(value: string): string {
 
 export default function AdminAnalyticsPage() {
   const [days, setDays] = useState(30);
-  const [limitTerms, setLimitTerms] = useState(8);
   const [state, setState] = useState<LoadingState>("idle");
   const [error, setError] = useState<string | null>(null);
   const [topTerms, setTopTerms] = useState<SearchTermCount[]>([]);
   const [termTrends, setTermTrends] = useState<SearchTermTrendPoint[]>([]);
   const [intentTrends, setIntentTrends] = useState<IntentTrendPoint[]>([]);
   const [weeklyInsights, setWeeklyInsights] = useState<WeeklyInsightCard[]>([]);
+  const [chatHistory, setChatHistory] = useState<AdminChatHistoryEvent[]>([]);
+  const [chatOffset, setChatOffset] = useState(0);
+  const [userHashFilter, setUserHashFilter] = useState("");
+  const [endpointHealth, setEndpointHealth] = useState<Record<string, "ok" | "error">>({});
 
   useEffect(() => {
     let mounted = true;
@@ -40,7 +45,7 @@ export default function AdminAnalyticsPage() {
       try {
         const [top, terms, intents, insights] = await Promise.all([
           getAdminTopSearchTerms({ days, limit: 20 }),
-          getAdminSearchTermTrends({ days, limitTerms }),
+          getAdminSearchTermTrends({ days, limitTerms: 8 }),
           getAdminIntentTrends({ days }),
           getAdminWeeklyInsights(),
         ]);
@@ -49,6 +54,12 @@ export default function AdminAnalyticsPage() {
         setTermTrends(terms);
         setIntentTrends(intents);
         setWeeklyInsights(insights);
+        setEndpointHealth({
+          topTerms: "ok",
+          termTrends: "ok",
+          intentTrends: "ok",
+          weeklyInsights: "ok",
+        });
         setState("ready");
       } catch (loadError) {
         if (!mounted) return;
@@ -62,7 +73,36 @@ export default function AdminAnalyticsPage() {
     return () => {
       mounted = false;
     };
-  }, [days, limitTerms]);
+  }, [days]);
+
+  useEffect(() => {
+    let mounted = true;
+    async function loadChatHistory() {
+      try {
+        const rows = await getAdminChatHistory({
+          days,
+          offset: chatOffset,
+          limit: 80,
+          userIdHash: userHashFilter.trim() || undefined,
+        });
+        if (!mounted) return;
+        setChatHistory(rows);
+        setEndpointHealth((prev) => ({ ...prev, chatHistory: "ok" }));
+      } catch {
+        if (!mounted) return;
+        setChatHistory([]);
+        setEndpointHealth((prev) => ({ ...prev, chatHistory: "error" }));
+      }
+    }
+
+    if (state === "ready") {
+      loadChatHistory();
+    }
+
+    return () => {
+      mounted = false;
+    };
+  }, [days, chatOffset, userHashFilter, state]);
 
   const maxTopCount = useMemo(() => {
     return topTerms.reduce((max, row) => (row.query_count > max ? row.query_count : max), 1);
@@ -77,6 +117,28 @@ export default function AdminAnalyticsPage() {
       .map(([intent, queryCount]) => ({ intent, queryCount }))
       .sort((a, b) => b.queryCount - a.queryCount);
   }, [intentTrends]);
+
+  const dailyVolumeSeries = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const row of termTrends) {
+      map.set(row.stat_date, (map.get(row.stat_date) || 0) + row.query_count);
+    }
+    return Array.from(map.entries())
+      .map(([statDate, total]) => ({ statDate, total }))
+      .sort((a, b) => (a.statDate < b.statDate ? -1 : 1));
+  }, [termTrends]);
+
+  const trendPolyline = useMemo(() => {
+    if (dailyVolumeSeries.length < 2) return "";
+    const max = dailyVolumeSeries.reduce((acc, item) => Math.max(acc, item.total), 1);
+    return dailyVolumeSeries
+      .map((point, index) => {
+        const x = (index / (dailyVolumeSeries.length - 1)) * 100;
+        const y = 100 - (point.total / max) * 100;
+        return `${x},${y}`;
+      })
+      .join(" ");
+  }, [dailyVolumeSeries]);
 
   return (
     <main className="min-h-screen bg-[#F9F6F2] px-4 py-6 text-[#1F2937] md:px-8">
@@ -101,16 +163,6 @@ export default function AdminAnalyticsPage() {
                 </option>
               ))}
             </select>
-
-            <label className="ml-2 text-sm font-medium">Tracked terms</label>
-            <input
-              type="number"
-              min={3}
-              max={20}
-              value={limitTerms}
-              onChange={(event) => setLimitTerms(Number(event.target.value) || 8)}
-              className="w-24 rounded-lg border border-[#D7C5B5] bg-white px-3 py-2 text-sm"
-            />
           </div>
         </header>
 
@@ -171,6 +223,28 @@ export default function AdminAnalyticsPage() {
               </div>
             </section>
 
+            <section className="rounded-2xl border border-[#D7C5B5] bg-white p-5">
+              <h2 className="text-lg font-semibold">Daily Query Volume Graph</h2>
+              {dailyVolumeSeries.length < 2 ? (
+                <p className="mt-3 text-sm text-[#64748B]">Not enough trend data to render graph.</p>
+              ) : (
+                <div className="mt-4">
+                  <svg viewBox="0 0 100 100" preserveAspectRatio="none" className="h-44 w-full rounded-lg bg-[#F8FAFC] p-2">
+                    <polyline
+                      fill="none"
+                      stroke="#7A1E1E"
+                      strokeWidth="2"
+                      points={trendPolyline}
+                    />
+                  </svg>
+                  <div className="mt-2 flex justify-between text-[11px] text-[#64748B]">
+                    <span>{formatDate(dailyVolumeSeries[0].statDate)}</span>
+                    <span>{formatDate(dailyVolumeSeries[dailyVolumeSeries.length - 1].statDate)}</span>
+                  </div>
+                </div>
+              )}
+            </section>
+
             <section className="grid gap-4 md:grid-cols-2">
               <div className="rounded-2xl border border-[#D7C5B5] bg-white p-5">
                 <h2 className="text-lg font-semibold">Intent Mix</h2>
@@ -214,6 +288,83 @@ export default function AdminAnalyticsPage() {
                     </tbody>
                   </table>
                 </div>
+              </div>
+            </section>
+
+            <section className="rounded-2xl border border-[#D7C5B5] bg-white p-5">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <h2 className="text-lg font-semibold">All Users Chat History</h2>
+                <div className="flex items-center gap-2 text-xs">
+                  <input
+                    value={userHashFilter}
+                    onChange={(event) => {
+                      setChatOffset(0);
+                      setUserHashFilter(event.target.value);
+                    }}
+                    placeholder="Filter by user hash"
+                    className="rounded-lg border border-[#D7C5B5] px-2 py-1.5 text-xs"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setChatOffset((prev) => Math.max(prev - 80, 0))}
+                    className="rounded border border-[#D7C5B5] px-2 py-1"
+                  >
+                    Prev
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setChatOffset((prev) => prev + 80)}
+                    className="rounded border border-[#D7C5B5] px-2 py-1"
+                  >
+                    Next
+                  </button>
+                </div>
+              </div>
+
+              <div className="mt-3 max-h-96 overflow-auto rounded-lg border border-[#E2E8F0]">
+                <table className="w-full text-left text-xs">
+                  <thead className="sticky top-0 bg-[#F8FAFC]">
+                    <tr className="border-b border-[#E2E8F0] text-[#475569]">
+                      <th className="px-2 py-2">Time</th>
+                      <th className="px-2 py-2">User</th>
+                      <th className="px-2 py-2">Conversation</th>
+                      <th className="px-2 py-2">Role</th>
+                      <th className="px-2 py-2">Intent</th>
+                      <th className="px-2 py-2">Message</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {chatHistory.map((row, index) => (
+                      <tr key={`${row.conversation_id}-${row.created_at}-${index}`} className="border-b border-[#F1F5F9] align-top">
+                        <td className="px-2 py-2 whitespace-nowrap">{new Date(row.created_at).toLocaleString()}</td>
+                        <td className="px-2 py-2 font-mono text-[10px]">{row.user_id_hash}</td>
+                        <td className="px-2 py-2 font-mono text-[10px]">{row.conversation_id}</td>
+                        <td className="px-2 py-2 capitalize">{row.role}</td>
+                        <td className="px-2 py-2">{row.intent || "-"}</td>
+                        <td className="px-2 py-2 text-[11px]">{row.message}</td>
+                      </tr>
+                    ))}
+                    {chatHistory.length === 0 && (
+                      <tr>
+                        <td className="px-2 py-3 text-[#64748B]" colSpan={6}>
+                          No chat history rows found for current filters.
+                        </td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </section>
+
+            <section className="rounded-2xl border border-[#D7C5B5] bg-white p-5">
+              <h2 className="text-lg font-semibold">Endpoint Health</h2>
+              <div className="mt-3 grid gap-2 md:grid-cols-2">
+                {Object.entries(endpointHealth).map(([key, value]) => (
+                  <div key={key} className="flex items-center justify-between rounded-lg bg-[#F8FAFC] px-3 py-2 text-sm">
+                    <span>{key}</span>
+                    <span className={value === "ok" ? "text-emerald-700" : "text-rose-700"}>{value}</span>
+                  </div>
+                ))}
               </div>
             </section>
           </>

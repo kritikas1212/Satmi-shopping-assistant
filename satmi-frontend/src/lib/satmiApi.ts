@@ -65,6 +65,16 @@ export type WeeklyInsightCard = {
   summary: string;
 };
 
+export type AdminChatHistoryEvent = {
+  conversation_id: string;
+  user_id_hash: string;
+  role: string;
+  message: string;
+  status: string;
+  intent?: string | null;
+  created_at: string;
+};
+
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL || "http://127.0.0.1:8000";
 const API_KEY = process.env.NEXT_PUBLIC_SATMI_API_KEY;
 
@@ -210,6 +220,37 @@ export async function getAdminWeeklyInsights(params?: {
 
   if (!response.ok) {
     throw new Error(`GET /admin/analytics/weekly-insights failed (${response.status})`);
+  }
+
+  return response.json();
+}
+
+export async function getAdminChatHistory(params: {
+  days: number;
+  limit?: number;
+  offset?: number;
+  userIdHash?: string;
+  idToken?: string;
+  supportRole?: "support_agent" | "admin";
+}): Promise<AdminChatHistoryEvent[]> {
+  const search = new URLSearchParams({
+    days: String(params.days),
+    limit: String(params.limit ?? 120),
+    offset: String(params.offset ?? 0),
+  });
+  if (params.userIdHash) {
+    search.set("user_id_hash", params.userIdHash);
+  }
+
+  const response = await fetch(`${API_BASE_URL}/admin/analytics/chat-history?${search.toString()}`, {
+    method: "GET",
+    headers: {
+      ...buildAdminHeaders(params.idToken, params.supportRole ?? "admin"),
+    },
+  });
+
+  if (!response.ok) {
+    throw new Error(`GET /admin/analytics/chat-history failed (${response.status})`);
   }
 
   return response.json();

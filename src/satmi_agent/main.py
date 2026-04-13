@@ -28,6 +28,7 @@ from satmi_agent.observability import (
 from satmi_agent.persistence import engine, persistence_service
 from satmi_agent.queueing import cancellation_queue_service
 from satmi_agent.schemas import (
+    AdminChatHistoryEvent,
     AsyncTaskResponse,
     ChatRequest,
     ChatResponse,
@@ -629,6 +630,35 @@ def admin_weekly_insights(_: None = Depends(require_support_role)) -> list[Weekl
     _ensure_admin_analytics_enabled()
     rows = persistence_service.get_weekly_insights()
     return [WeeklyInsightCard(**row) for row in rows]
+
+
+@app.get("/admin/analytics/chat-history", response_model=list[AdminChatHistoryEvent])
+def admin_chat_history(
+    days: int = Query(default=30, ge=1, le=180),
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0, le=5000),
+    user_id_hash: str | None = Query(default=None, min_length=8, max_length=64),
+    _: None = Depends(require_support_role),
+) -> list[AdminChatHistoryEvent]:
+    _ensure_admin_analytics_enabled()
+    rows = persistence_service.list_admin_chat_history(
+        days=days,
+        limit=limit,
+        offset=offset,
+        user_id_hash=user_id_hash,
+    )
+    return [
+        AdminChatHistoryEvent(
+            conversation_id=row["conversation_id"],
+            user_id_hash=row["user_id_hash"],
+            role=row["role"],
+            message=scrub_pii(row["message"]),
+            status=row["status"],
+            intent=row.get("intent"),
+            created_at=row["created_at"],
+        )
+        for row in rows
+    ]
 
 
 @app.get("/tasks/{task_id}", response_model=AsyncTaskResponse)
