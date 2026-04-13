@@ -15,29 +15,26 @@ type ChatBubbleProps = {
 const CARD_IMAGE_FALLBACK =
   "https://placehold.co/640x400/FDE68A/7C2D12?text=SATMI+Product";
 
-function openShopifyCheckout(product: ProductRecommendation) {
+function getShopifyCheckoutUrl(product: ProductRecommendation): string {
   const variantId = String(product.variant_id || "").trim();
   const handle = String(product.handle || "").trim();
   const productUrl = String(product.product_url || product.url || "").trim();
 
   // Priority 1: Variant-based GoKwik checkout URL
   if (variantId) {
-    window.location.href = `https://satmi.in/?pid=${variantId}&custom_source=true`;
-    return;
+    return `https://satmi.in/?pid=${variantId}&custom_source=true`;
   }
 
   // Priority 2: Product page fallback
   if (productUrl) {
-    window.location.href = productUrl;
-    return;
+    return productUrl;
   }
 
   if (handle) {
-    window.location.href = `https://satmi.in/products/${handle}`;
-    return;
+    return `https://satmi.in/products/${handle}`;
   }
 
-  window.location.href = "https://satmi.in";
+  return "https://satmi.in";
 }
 
 export default function ChatBubble({ role, content, recommendedProducts = [], onDismissCards }: ChatBubbleProps) {
@@ -105,13 +102,14 @@ export default function ChatBubble({ role, content, recommendedProducts = [], on
                 <p className="line-clamp-2 text-xs font-medium text-[#000000]">{product.title}</p>
                 <p className="text-sm font-bold text-[#000000]">{product.price}</p>
                 <div className="mt-2 flex items-center justify-between gap-2">
-                  <button
-                    type="button"
-                    onClick={() => openShopifyCheckout(product)}
+                  <a
+                    href={getShopifyCheckoutUrl(product)}
+                    target="_top"
+                    rel="noopener noreferrer"
                     className="rounded-lg bg-[#7A1E1E] px-2.5 py-1.5 text-[11px] font-semibold text-[#F9F6F2] transition hover:opacity-90"
                   >
                     Select & Buy
-                  </button>
+                  </a>
                   <button
                     type="button"
                     onClick={() => window.open(viewLink, "_blank")}
