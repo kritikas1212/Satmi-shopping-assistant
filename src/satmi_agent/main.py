@@ -87,6 +87,8 @@ def _cors_allow_origins() -> list[str]:
         "https://satmi.in",
         "https://www.satmi.in",
         "https://accounts.satmi.in",
+        "https://satmi.myshopify.com",
+        "https://satmi-shopping-assistant.vercel.app",
         "http://localhost:3000",
         "http://127.0.0.1:3000",
     }
