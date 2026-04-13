@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Literal
 
-from sqlalchemy import JSON, DateTime, Float, String, Text, create_engine, func, select
+from sqlalchemy import JSON, Boolean, Date, DateTime, Float, Integer, String, Text, create_engine, func, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 from satmi_agent.config import settings
@@ -91,6 +91,47 @@ class ProductCatalogRecord(Base):
     searchable_text: Mapped[str] = mapped_column(Text, default="", index=True)
     shopify_updated_at: Mapped[str | None] = mapped_column(String(64), nullable=True)
     synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
+
+
+class ChatQueryEventRecord(Base):
+    __tablename__ = "chat_query_events"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    conversation_id: Mapped[str] = mapped_column(String(128), index=True)
+    user_id_hash: Mapped[str] = mapped_column(String(128), index=True)
+    masked_query: Mapped[str] = mapped_column(Text)
+    normalized_term: Mapped[str] = mapped_column(String(256), index=True)
+    intent: Mapped[str] = mapped_column(String(32), index=True, default="unknown")
+    had_recommendations: Mapped[bool] = mapped_column(Boolean, default=False)
+    recommendation_count: Mapped[int] = mapped_column(Integer, default=0)
+    latency_bucket: Mapped[str] = mapped_column(String(32), default="unknown", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
+
+
+class SearchTermDailyStatRecord(Base):
+    __tablename__ = "search_term_daily_stats"
+
+    stat_date: Mapped[date] = mapped_column(Date, primary_key=True)
+    normalized_term: Mapped[str] = mapped_column(String(256), primary_key=True)
+    query_count: Mapped[int] = mapped_column(Integer, default=0)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+
+class QueryIntentDailyStatRecord(Base):
+    __tablename__ = "query_intent_daily_stats"
+
+    stat_date: Mapped[date] = mapped_column(Date, primary_key=True)
+    intent: Mapped[str] = mapped_column(String(32), primary_key=True)
+    query_count: Mapped[int] = mapped_column(Integer, default=0)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
 
 
 def _normalize_database_url(url: str) -> str:
@@ -340,6 +381,153 @@ class PersistenceService:
             "product_count": product_count,
             "latest_sync_at": latest_sync_at,
         }
+
+    def create_chat_query_event(
+        self,
+        *,
+        conversation_id: str,
+        user_id_hash: str,
+        masked_query: str,
+        normalized_term: str,
+        intent: str,
+        had_recommendations: bool,
+        recommendation_count: int,
+        latency_bucket: str,
+    ) -> None:
+        now = datetime.now(timezone.utc)
+        stat_day = now.date()
+
+        with self._session() as session:
+            event = ChatQueryEventRecord(
+                conversation_id=conversation_id,
+                user_id_hash=user_id_hash,
+                masked_query=masked_query,
+                normalized_term=normalized_term,
+                intent=intent,
+                had_recommendations=had_recommendations,
+                recommendation_count=max(int(recommendation_count), 0),
+                latency_bucket=latency_bucket,
+                created_at=now,
+            )
+            session.add(event)
+
+            term_row = session.get(
+                SearchTermDailyStatRecord,
+                {"stat_date": stat_day, "normalized_term": normalized_term},
+            )
+            if term_row is None:
+                term_row = SearchTermDailyStatRecord(
+                    stat_date=stat_day,
+                    normalized_term=normalized_term,
+                    query_count=1,
+                    updated_at=now,
+                )
+                session.add(term_row)
+            else:
+                term_row.query_count += 1
+                term_row.updated_at = now
+
+            intent_row = session.get(
+                QueryIntentDailyStatRecord,
+                {"stat_date": stat_day, "intent": intent},
+            )
+            if intent_row is None:
+                intent_row = QueryIntentDailyStatRecord(
+                    stat_date=stat_day,
+                    intent=intent,
+                    query_count=1,
+                    updated_at=now,
+                )
+                session.add(intent_row)
+            else:
+                intent_row.query_count += 1
+                intent_row.updated_at = now
+
+            session.commit()
+
+    def list_top_search_terms(self, *, days: int = 7, limit: int = 20) -> list[dict[str, Any]]:
+        cutoff_day = datetime.now(timezone.utc).date() - timedelta(days=max(days, 1) - 1)
+        with self._session() as session:
+            stmt = (
+                select(
+                    SearchTermDailyStatRecord.normalized_term,
+                    func.sum(SearchTermDailyStatRecord.query_count).label("query_count"),
+                )
+                .where(SearchTermDailyStatRecord.stat_date >= cutoff_day)
+                .group_by(SearchTermDailyStatRecord.normalized_term)
+                .order_by(func.sum(SearchTermDailyStatRecord.query_count).desc())
+                .limit(max(limit, 1))
+            )
+            rows = session.execute(stmt).all()
+
+        return [
+            {
+                "normalized_term": str(row.normalized_term),
+                "query_count": int(row.query_count or 0),
+            }
+            for row in rows
+        ]
+
+    def list_search_term_trends(self, *, days: int = 30, limit_terms: int = 8) -> list[dict[str, Any]]:
+        cutoff_day = datetime.now(timezone.utc).date() - timedelta(days=max(days, 1) - 1)
+        with self._session() as session:
+            top_stmt = (
+                select(
+                    SearchTermDailyStatRecord.normalized_term,
+                    func.sum(SearchTermDailyStatRecord.query_count).label("query_count"),
+                )
+                .where(SearchTermDailyStatRecord.stat_date >= cutoff_day)
+                .group_by(SearchTermDailyStatRecord.normalized_term)
+                .order_by(func.sum(SearchTermDailyStatRecord.query_count).desc())
+                .limit(max(limit_terms, 1))
+            )
+            top_terms = [str(row.normalized_term) for row in session.execute(top_stmt).all()]
+            if not top_terms:
+                return []
+
+            trend_stmt = (
+                select(
+                    SearchTermDailyStatRecord.stat_date,
+                    SearchTermDailyStatRecord.normalized_term,
+                    SearchTermDailyStatRecord.query_count,
+                )
+                .where(SearchTermDailyStatRecord.stat_date >= cutoff_day)
+                .where(SearchTermDailyStatRecord.normalized_term.in_(top_terms))
+                .order_by(SearchTermDailyStatRecord.stat_date.asc(), SearchTermDailyStatRecord.normalized_term.asc())
+            )
+            rows = session.execute(trend_stmt).all()
+
+        return [
+            {
+                "stat_date": row.stat_date.isoformat(),
+                "normalized_term": str(row.normalized_term),
+                "query_count": int(row.query_count or 0),
+            }
+            for row in rows
+        ]
+
+    def list_intent_daily_trends(self, *, days: int = 30) -> list[dict[str, Any]]:
+        cutoff_day = datetime.now(timezone.utc).date() - timedelta(days=max(days, 1) - 1)
+        with self._session() as session:
+            stmt = (
+                select(
+                    QueryIntentDailyStatRecord.stat_date,
+                    QueryIntentDailyStatRecord.intent,
+                    QueryIntentDailyStatRecord.query_count,
+                )
+                .where(QueryIntentDailyStatRecord.stat_date >= cutoff_day)
+                .order_by(QueryIntentDailyStatRecord.stat_date.asc(), QueryIntentDailyStatRecord.intent.asc())
+            )
+            rows = session.execute(stmt).all()
+
+        return [
+            {
+                "stat_date": row.stat_date.isoformat(),
+                "intent": str(row.intent),
+                "query_count": int(row.query_count or 0),
+            }
+            for row in rows
+        ]
 
 
 persistence_service = PersistenceService()

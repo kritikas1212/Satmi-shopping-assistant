@@ -113,3 +113,20 @@ class VerifyOtpResponse(BaseModel):
     success: bool
     token: str | None = None
     message: str
+
+
+class SearchTermCount(BaseModel):
+    normalized_term: str
+    query_count: int
+
+
+class SearchTermTrendPoint(BaseModel):
+    stat_date: str
+    normalized_term: str
+    query_count: int
+
+
+class IntentTrendPoint(BaseModel):
+    stat_date: str
+    intent: str
+    query_count: int

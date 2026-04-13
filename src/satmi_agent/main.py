@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+import hashlib
+import logging
 from pathlib import Path
+import re
 import time
 from typing import Any
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from sqlalchemy import text
@@ -30,8 +33,11 @@ from satmi_agent.schemas import (
     ChatResponse,
     ConversationEventResponse,
     HandoffStatusUpdateRequest,
+    IntentTrendPoint,
     HandoffTicketResponse,
     ResumeHandoffRequest,
+    SearchTermCount,
+    SearchTermTrendPoint,
 )
 from satmi_agent.security import (
     enforce_chat_rate_limit,
@@ -50,6 +56,9 @@ try:
     from langgraph.types import Command
 except Exception:  # pragma: no cover
     Command = None
+
+
+logger = logging.getLogger("satmi_agent.analytics")
 
 
 async def _warm_catalog_cache() -> None:
@@ -180,6 +189,82 @@ def _mask_path(value: str | None) -> str | None:
         return None
     name = Path(value).name
     return f".../{name}"
+
+
+_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "for",
+    "from",
+    "how",
+    "i",
+    "in",
+    "is",
+    "me",
+    "my",
+    "of",
+    "on",
+    "or",
+    "please",
+    "show",
+    "the",
+    "to",
+    "want",
+    "with",
+}
+
+
+def _normalize_search_term(text: str) -> str:
+    lowered = re.sub(r"[^a-z0-9\s]", " ", (text or "").lower())
+    tokens = [token for token in lowered.split() if token and token not in _STOPWORDS]
+    phrase = " ".join(tokens[:8]).strip()
+    return phrase or "general_query"
+
+
+def _hash_user_id(user_id: str) -> str:
+    return hashlib.sha256((user_id or "unknown").encode("utf-8")).hexdigest()[:32]
+
+
+def _latency_bucket(seconds: float) -> str:
+    ms = max(seconds * 1000.0, 0.0)
+    if ms < 300:
+        return "lt_300ms"
+    if ms < 1000:
+        return "300ms_1s"
+    if ms < 3000:
+        return "1s_3s"
+    return "gte_3s"
+
+
+def _record_chat_analytics_safe(
+    *,
+    conversation_id: str,
+    user_id: str,
+    user_message_masked: str,
+    intent: str,
+    recommendation_count: int,
+    latency_seconds: float,
+) -> None:
+    try:
+        persistence_service.create_chat_query_event(
+            conversation_id=conversation_id,
+            user_id_hash=_hash_user_id(user_id),
+            masked_query=user_message_masked,
+            normalized_term=_normalize_search_term(user_message_masked),
+            intent=_normalize_chat_intent(intent),
+            had_recommendations=recommendation_count > 0,
+            recommendation_count=recommendation_count,
+            latency_bucket=_latency_bucket(latency_seconds),
+        )
+    except Exception as exc:  # pragma: no cover
+        logger.warning("Analytics capture failed: %s", exc)
+
+
+def _ensure_admin_analytics_enabled() -> None:
+    if not settings.analytics_admin_panel_enabled:
+        raise HTTPException(status_code=404, detail="Analytics admin endpoints disabled")
 
 
 def _load_recent_message_history(conversation_id: str, limit: int = 12) -> list[dict[str, str]]:
@@ -392,9 +477,11 @@ def metrics(_: None = Depends(require_support_role)) -> Response:
 @app.post("/chat")
 def chat(
     request: ChatRequest,
+    background_tasks: BackgroundTasks,
     http_request: Request,
     _: None = Depends(require_api_key),
 ) -> ChatResponse | dict[str, Any]:
+    chat_started_at = time.perf_counter()
     enforce_chat_rate_limit(http_request, request.user_id)
     masked_user_message = scrub_pii(request.message or "")
     order_context: list[dict[str, Any]] = []
@@ -460,6 +547,17 @@ def chat(
     recommended_products = _safe_recommended_products(_coerce_recommended_products(final_state))
     recommendation_source = (final_state.get("tool_result") or {}).get("source")
 
+    if settings.analytics_enabled:
+        background_tasks.add_task(
+            _record_chat_analytics_safe,
+            conversation_id=request.conversation_id,
+            user_id=request.user_id,
+            user_message_masked=masked_user_message,
+            intent=intent_value,
+            recommendation_count=len(recommended_products),
+            latency_seconds=time.perf_counter() - chat_started_at,
+        )
+
     record_chat_outcome(status=status_value, intent=intent_value)
     if final_state.get("handoff_id"):
         record_handoff_created(final_state.get("handoff_reason", "unspecified"))
@@ -491,6 +589,38 @@ def chat(
             "message_history": scrub_pii(message_history),
         },
     )
+
+
+@app.get("/admin/analytics/top-search-terms", response_model=list[SearchTermCount])
+def admin_top_search_terms(
+    days: int = Query(default=7, ge=1, le=90),
+    limit: int = Query(default=20, ge=1, le=100),
+    _: None = Depends(require_support_role),
+) -> list[SearchTermCount]:
+    _ensure_admin_analytics_enabled()
+    rows = persistence_service.list_top_search_terms(days=days, limit=limit)
+    return [SearchTermCount(**row) for row in rows]
+
+
+@app.get("/admin/analytics/search-term-trends", response_model=list[SearchTermTrendPoint])
+def admin_search_term_trends(
+    days: int = Query(default=30, ge=1, le=180),
+    limit_terms: int = Query(default=8, ge=1, le=30),
+    _: None = Depends(require_support_role),
+) -> list[SearchTermTrendPoint]:
+    _ensure_admin_analytics_enabled()
+    rows = persistence_service.list_search_term_trends(days=days, limit_terms=limit_terms)
+    return [SearchTermTrendPoint(**row) for row in rows]
+
+
+@app.get("/admin/analytics/intent-trends", response_model=list[IntentTrendPoint])
+def admin_intent_trends(
+    days: int = Query(default=30, ge=1, le=180),
+    _: None = Depends(require_support_role),
+) -> list[IntentTrendPoint]:
+    _ensure_admin_analytics_enabled()
+    rows = persistence_service.list_intent_daily_trends(days=days)
+    return [IntentTrendPoint(**row) for row in rows]
 
 
 @app.get("/tasks/{task_id}", response_model=AsyncTaskResponse)
