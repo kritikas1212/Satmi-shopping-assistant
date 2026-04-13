@@ -130,3 +130,12 @@ class IntentTrendPoint(BaseModel):
     stat_date: str
     intent: str
     query_count: int
+
+
+class WeeklyInsightCard(BaseModel):
+    key: str
+    title: str
+    value: str
+    delta_percent: float | None = None
+    direction: Literal["up", "down", "flat"]
+    summary: str

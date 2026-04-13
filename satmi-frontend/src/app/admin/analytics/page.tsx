@@ -5,9 +5,11 @@ import {
   getAdminIntentTrends,
   getAdminSearchTermTrends,
   getAdminTopSearchTerms,
+  getAdminWeeklyInsights,
   IntentTrendPoint,
   SearchTermCount,
   SearchTermTrendPoint,
+  WeeklyInsightCard,
 } from "@/lib/satmiApi";
 
 type LoadingState = "idle" | "loading" | "ready" | "error";
@@ -28,6 +30,7 @@ export default function AdminAnalyticsPage() {
   const [topTerms, setTopTerms] = useState<SearchTermCount[]>([]);
   const [termTrends, setTermTrends] = useState<SearchTermTrendPoint[]>([]);
   const [intentTrends, setIntentTrends] = useState<IntentTrendPoint[]>([]);
+  const [weeklyInsights, setWeeklyInsights] = useState<WeeklyInsightCard[]>([]);
 
   useEffect(() => {
     let mounted = true;
@@ -35,15 +38,17 @@ export default function AdminAnalyticsPage() {
       setState("loading");
       setError(null);
       try {
-        const [top, terms, intents] = await Promise.all([
+        const [top, terms, intents, insights] = await Promise.all([
           getAdminTopSearchTerms({ days, limit: 20 }),
           getAdminSearchTermTrends({ days, limitTerms }),
           getAdminIntentTrends({ days }),
+          getAdminWeeklyInsights(),
         ]);
         if (!mounted) return;
         setTopTerms(top);
         setTermTrends(terms);
         setIntentTrends(intents);
+        setWeeklyInsights(insights);
         setState("ready");
       } catch (loadError) {
         if (!mounted) return;
@@ -121,6 +126,30 @@ export default function AdminAnalyticsPage() {
 
         {state === "ready" && (
           <>
+            <section className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+              {weeklyInsights.map((card) => (
+                <article key={card.key} className="rounded-2xl border border-[#D7C5B5] bg-white p-4">
+                  <p className="text-xs uppercase tracking-wide text-[#7A1E1E]">{card.title}</p>
+                  <p className="mt-2 text-xl font-semibold text-[#111827]">{card.value}</p>
+                  <p className="mt-1 text-xs text-[#64748B]">{card.summary}</p>
+                  {typeof card.delta_percent === "number" && (
+                    <p
+                      className={`mt-2 text-xs font-medium ${
+                        card.direction === "up"
+                          ? "text-emerald-700"
+                          : card.direction === "down"
+                            ? "text-rose-700"
+                            : "text-slate-600"
+                      }`}
+                    >
+                      {card.delta_percent > 0 ? "+" : ""}
+                      {card.delta_percent}% vs previous week
+                    </p>
+                  )}
+                </article>
+              ))}
+            </section>
+
             <section className="rounded-2xl border border-[#D7C5B5] bg-white p-5">
               <h2 className="text-lg font-semibold">Top Search Terms</h2>
               <div className="mt-4 space-y-3">

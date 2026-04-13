@@ -38,6 +38,7 @@ from satmi_agent.schemas import (
     ResumeHandoffRequest,
     SearchTermCount,
     SearchTermTrendPoint,
+    WeeklyInsightCard,
 )
 from satmi_agent.security import (
     enforce_chat_rate_limit,
@@ -621,6 +622,13 @@ def admin_intent_trends(
     _ensure_admin_analytics_enabled()
     rows = persistence_service.list_intent_daily_trends(days=days)
     return [IntentTrendPoint(**row) for row in rows]
+
+
+@app.get("/admin/analytics/weekly-insights", response_model=list[WeeklyInsightCard])
+def admin_weekly_insights(_: None = Depends(require_support_role)) -> list[WeeklyInsightCard]:
+    _ensure_admin_analytics_enabled()
+    rows = persistence_service.get_weekly_insights()
+    return [WeeklyInsightCard(**row) for row in rows]
 
 
 @app.get("/tasks/{task_id}", response_model=AsyncTaskResponse)

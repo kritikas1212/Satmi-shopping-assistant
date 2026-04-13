@@ -56,6 +56,15 @@ export type IntentTrendPoint = {
   query_count: number;
 };
 
+export type WeeklyInsightCard = {
+  key: string;
+  title: string;
+  value: string;
+  delta_percent?: number | null;
+  direction: "up" | "down" | "flat";
+  summary: string;
+};
+
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL || "http://127.0.0.1:8000";
 const API_KEY = process.env.NEXT_PUBLIC_SATMI_API_KEY;
 
@@ -183,6 +192,24 @@ export async function getAdminIntentTrends(params: {
 
   if (!response.ok) {
     throw new Error(`GET /admin/analytics/intent-trends failed (${response.status})`);
+  }
+
+  return response.json();
+}
+
+export async function getAdminWeeklyInsights(params?: {
+  idToken?: string;
+  supportRole?: "support_agent" | "admin";
+}): Promise<WeeklyInsightCard[]> {
+  const response = await fetch(`${API_BASE_URL}/admin/analytics/weekly-insights`, {
+    method: "GET",
+    headers: {
+      ...buildAdminHeaders(params?.idToken, params?.supportRole ?? "admin"),
+    },
+  });
+
+  if (!response.ok) {
+    throw new Error(`GET /admin/analytics/weekly-insights failed (${response.status})`);
   }
 
   return response.json();

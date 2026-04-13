@@ -529,5 +529,130 @@ class PersistenceService:
             for row in rows
         ]
 
+    def get_weekly_insights(self) -> list[dict[str, Any]]:
+        today = datetime.now(timezone.utc).date()
+        current_start = today - timedelta(days=6)
+        previous_end = current_start - timedelta(days=1)
+        previous_start = previous_end - timedelta(days=6)
+
+        with self._session() as session:
+            total_current_stmt = (
+                select(func.count(ChatQueryEventRecord.id))
+                .where(func.date(ChatQueryEventRecord.created_at) >= current_start)
+                .where(func.date(ChatQueryEventRecord.created_at) <= today)
+            )
+            total_previous_stmt = (
+                select(func.count(ChatQueryEventRecord.id))
+                .where(func.date(ChatQueryEventRecord.created_at) >= previous_start)
+                .where(func.date(ChatQueryEventRecord.created_at) <= previous_end)
+            )
+            total_current = int(session.scalar(total_current_stmt) or 0)
+            total_previous = int(session.scalar(total_previous_stmt) or 0)
+
+            recommend_current_stmt = (
+                select(func.count(ChatQueryEventRecord.id))
+                .where(func.date(ChatQueryEventRecord.created_at) >= current_start)
+                .where(func.date(ChatQueryEventRecord.created_at) <= today)
+                .where(ChatQueryEventRecord.had_recommendations.is_(True))
+            )
+            recommend_previous_stmt = (
+                select(func.count(ChatQueryEventRecord.id))
+                .where(func.date(ChatQueryEventRecord.created_at) >= previous_start)
+                .where(func.date(ChatQueryEventRecord.created_at) <= previous_end)
+                .where(ChatQueryEventRecord.had_recommendations.is_(True))
+            )
+            recommend_current = int(session.scalar(recommend_current_stmt) or 0)
+            recommend_previous = int(session.scalar(recommend_previous_stmt) or 0)
+
+            top_term_current_stmt = (
+                select(
+                    SearchTermDailyStatRecord.normalized_term,
+                    func.sum(SearchTermDailyStatRecord.query_count).label("query_count"),
+                )
+                .where(SearchTermDailyStatRecord.stat_date >= current_start)
+                .where(SearchTermDailyStatRecord.stat_date <= today)
+                .group_by(SearchTermDailyStatRecord.normalized_term)
+                .order_by(func.sum(SearchTermDailyStatRecord.query_count).desc())
+                .limit(1)
+            )
+            top_term_previous_stmt = (
+                select(
+                    SearchTermDailyStatRecord.normalized_term,
+                    func.sum(SearchTermDailyStatRecord.query_count).label("query_count"),
+                )
+                .where(SearchTermDailyStatRecord.stat_date >= previous_start)
+                .where(SearchTermDailyStatRecord.stat_date <= previous_end)
+                .group_by(SearchTermDailyStatRecord.normalized_term)
+                .order_by(func.sum(SearchTermDailyStatRecord.query_count).desc())
+                .limit(1)
+            )
+            top_term_current = session.execute(top_term_current_stmt).first()
+            top_term_previous = session.execute(top_term_previous_stmt).first()
+
+            top_intent_current_stmt = (
+                select(
+                    QueryIntentDailyStatRecord.intent,
+                    func.sum(QueryIntentDailyStatRecord.query_count).label("query_count"),
+                )
+                .where(QueryIntentDailyStatRecord.stat_date >= current_start)
+                .where(QueryIntentDailyStatRecord.stat_date <= today)
+                .group_by(QueryIntentDailyStatRecord.intent)
+                .order_by(func.sum(QueryIntentDailyStatRecord.query_count).desc())
+                .limit(1)
+            )
+            top_intent_current = session.execute(top_intent_current_stmt).first()
+
+        def pct_delta(current: int, previous: int) -> float | None:
+            if previous <= 0:
+                return None
+            return round(((current - previous) / previous) * 100.0, 2)
+
+        def direction(current: int, previous: int) -> str:
+            if current > previous:
+                return "up"
+            if current < previous:
+                return "down"
+            return "flat"
+
+        top_term_text = str(top_term_current.normalized_term) if top_term_current else "n/a"
+        top_term_count = int(top_term_current.query_count or 0) if top_term_current else 0
+        previous_top_term = str(top_term_previous.normalized_term) if top_term_previous else "n/a"
+
+        insights = [
+            {
+                "key": "weekly_volume",
+                "title": "Weekly Query Volume",
+                "value": f"{total_current}",
+                "delta_percent": pct_delta(total_current, total_previous),
+                "direction": direction(total_current, total_previous),
+                "summary": f"Current 7 days vs previous 7 days ({total_previous}).",
+            },
+            {
+                "key": "recommendation_coverage",
+                "title": "Queries With Recommendations",
+                "value": f"{recommend_current}",
+                "delta_percent": pct_delta(recommend_current, recommend_previous),
+                "direction": direction(recommend_current, recommend_previous),
+                "summary": "Tracks how often users receive product recommendations.",
+            },
+            {
+                "key": "top_term",
+                "title": "Top Weekly Search Term",
+                "value": f"{top_term_text} ({top_term_count})",
+                "delta_percent": None,
+                "direction": "flat",
+                "summary": f"Previous week top term: {previous_top_term}.",
+            },
+            {
+                "key": "top_intent",
+                "title": "Top Weekly Intent",
+                "value": str(top_intent_current.intent) if top_intent_current else "unknown",
+                "delta_percent": None,
+                "direction": "flat",
+                "summary": f"Count: {int(top_intent_current.query_count or 0) if top_intent_current else 0}.",
+            },
+        ]
+        return insights
+
 
 persistence_service = PersistenceService()
