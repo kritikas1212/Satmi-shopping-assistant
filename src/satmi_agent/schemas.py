@@ -113,3 +113,39 @@ class VerifyOtpResponse(BaseModel):
     success: bool
     token: str | None = None
     message: str
+
+
+class SearchTermCount(BaseModel):
+    normalized_term: str
+    query_count: int
+
+
+class SearchTermTrendPoint(BaseModel):
+    stat_date: str
+    normalized_term: str
+    query_count: int
+
+
+class IntentTrendPoint(BaseModel):
+    stat_date: str
+    intent: str
+    query_count: int
+
+
+class WeeklyInsightCard(BaseModel):
+    key: str
+    title: str
+    value: str
+    delta_percent: float | None = None
+    direction: Literal["up", "down", "flat"]
+    summary: str
+
+
+class AdminChatHistoryEvent(BaseModel):
+    conversation_id: str
+    user_id_hash: str
+    role: str
+    message: str
+    status: str
+    intent: str | None = None
+    created_at: str

@@ -29,6 +29,8 @@ class Settings(BaseSettings):
     observability_enabled: bool = True
     metrics_endpoint_enabled: bool = True
     metrics_endpoint_path: str = "/metrics"
+    analytics_enabled: bool = False
+    analytics_admin_panel_enabled: bool = False
     tracing_enabled: bool = False
     tracing_service_name: str = "satmi-chatbot"
     tracing_exporter: str = "otlp"
