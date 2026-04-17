@@ -162,7 +162,7 @@ export default function SatmiChat() {
     return new Promise<void>((resolve) => {
       const intervalId = window.setInterval(async () => {
         try {
-          const task = await getTask(taskId, undefined);
+          const task = await getTask(taskId);
 
           if (task.status === "completed") {
             window.clearInterval(intervalId);

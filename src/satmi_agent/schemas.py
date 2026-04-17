@@ -149,3 +149,68 @@ class AdminChatHistoryEvent(BaseModel):
     status: str
     intent: str | None = None
     created_at: str
+
+
+class DashboardChatMessage(BaseModel):
+    role: Literal["user", "assistant", "system"]
+    message: str
+    created_at: str
+    intent: str | None = None
+
+
+class DashboardChatSession(BaseModel):
+    conversation_id: str
+    user_id_hash: str
+    is_frustrated: bool
+    status: Literal["Resolved", "Abandoned"]
+    dominant_category: Literal["Order Tracking", "Product Search", "Returns", "Policy & FAQ", "General"]
+    dominant_intent: str
+    started_at: str
+    last_activity_at: str
+
+
+class ChatTranscriptResponse(BaseModel):
+    conversation_id: str
+    transcript: list[DashboardChatMessage] = Field(default_factory=list)
+
+
+class DashboardCategorySlice(BaseModel):
+    category: Literal["Order Tracking", "Product Search", "Returns", "Policy & FAQ", "General"]
+    count: int
+    percentage: float
+
+
+class DashboardIntentSlice(BaseModel):
+    intent: str
+    count: int
+    percentage: float
+
+
+class DashboardTopTrend(BaseModel):
+    term: str
+    count: int
+
+
+class DashboardAnalyticsSummary(BaseModel):
+    resolution_rate: float
+    category_divide: list[DashboardCategorySlice] = Field(default_factory=list)
+    intent_breakdown: list[DashboardIntentSlice] = Field(default_factory=list)
+    top_trending_terms: list[DashboardTopTrend] = Field(default_factory=list)
+
+
+class DashboardSnapshotResponse(BaseModel):
+    total_sessions: int = 0
+    chats: list[DashboardChatSession] = Field(default_factory=list)
+    analytics: DashboardAnalyticsSummary
+
+
+class DashboardExportRow(BaseModel):
+    conversation_id: str
+    user_id_hash: str
+    session_status: str
+    dominant_category: str
+    dominant_intent: str
+    role: str
+    intent: str | None = None
+    message: str
+    created_at: str
