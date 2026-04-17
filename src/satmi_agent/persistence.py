@@ -13,6 +13,13 @@ from satmi_agent.security import scrub_pii
 from satmi_agent.schemas import HandoffStatus
 
 
+# Safety caps for admin dashboard queries so a single very large conversation
+# cannot exhaust worker memory during snapshot/transcript/export rendering.
+DASHBOARD_SESSION_EVENT_LIMIT = 250
+DASHBOARD_TRANSCRIPT_EVENT_LIMIT = 500
+DASHBOARD_EXPORT_EVENT_LIMIT = 500
+
+
 class Base(DeclarativeBase):
     pass
 
@@ -822,6 +829,7 @@ class PersistenceService:
     def list_dashboard_chat_sessions(self, *, limit: int = 150, offset: int = 0) -> dict[str, Any]:
         target_limit = max(min(limit, 150), 1)
         target_offset = max(offset, 0)
+        session_event_limit = DASHBOARD_SESSION_EVENT_LIMIT
         category_labels = ["Order Tracking", "Product Search", "Returns", "Policy & FAQ", "General"]
         intent_labels = ["Product Discovery", "Order Tracking", "Policy & FAQ", "Account & Login", "General Inquiry"]
 
@@ -894,11 +902,26 @@ class PersistenceService:
                 }
 
             conversation_ids = [str(row.conversation_id) for row in session_rows]
+            ranked_events_subquery = (
+                select(
+                    ConversationEventRecord.id.label("event_id"),
+                    func.row_number()
+                    .over(
+                        partition_by=ConversationEventRecord.conversation_id,
+                        order_by=ConversationEventRecord.created_at.desc(),
+                    )
+                    .label("row_num"),
+                )
+                .where(ConversationEventRecord.conversation_id.in_(conversation_ids))
+                .where(ConversationEventRecord.role.in_(["user", "assistant", "system"]))
+                .subquery()
+            )
+
             rows = list(
                 session.scalars(
                     select(ConversationEventRecord)
-                    .where(ConversationEventRecord.conversation_id.in_(conversation_ids))
-                    .where(ConversationEventRecord.role.in_(["user", "assistant", "system"]))
+                    .join(ranked_events_subquery, ConversationEventRecord.id == ranked_events_subquery.c.event_id)
+                    .where(ranked_events_subquery.c.row_num <= session_event_limit)
                     .order_by(ConversationEventRecord.created_at.asc())
                 ).all()
             )
@@ -1056,8 +1079,11 @@ class PersistenceService:
                 select(ConversationEventRecord)
                 .where(ConversationEventRecord.conversation_id == conversation_id)
                 .where(ConversationEventRecord.role.in_(["user", "assistant", "system"]))
-                .order_by(ConversationEventRecord.created_at.asc())
+                .order_by(ConversationEventRecord.created_at.desc())
+                .limit(DASHBOARD_TRANSCRIPT_EVENT_LIMIT)
             ).all()
+
+        rows = list(reversed(rows))
 
         return [
             {
@@ -1077,13 +1103,29 @@ class PersistenceService:
 
         session_lookup = {item["conversation_id"]: item for item in sessions}
         conversation_ids = list(session_lookup.keys())
+        export_event_limit = DASHBOARD_EXPORT_EVENT_LIMIT
 
         with self._session() as session:
+            ranked_events_subquery = (
+                select(
+                    ConversationEventRecord.id.label("event_id"),
+                    func.row_number()
+                    .over(
+                        partition_by=ConversationEventRecord.conversation_id,
+                        order_by=ConversationEventRecord.created_at.desc(),
+                    )
+                    .label("row_num"),
+                )
+                .where(ConversationEventRecord.conversation_id.in_(conversation_ids))
+                .where(ConversationEventRecord.role.in_(["user", "assistant", "system"]))
+                .subquery()
+            )
+
             events = list(
                 session.scalars(
                     select(ConversationEventRecord)
-                    .where(ConversationEventRecord.conversation_id.in_(conversation_ids))
-                    .where(ConversationEventRecord.role.in_(["user", "assistant", "system"]))
+                    .join(ranked_events_subquery, ConversationEventRecord.id == ranked_events_subquery.c.event_id)
+                    .where(ranked_events_subquery.c.row_num <= export_event_limit)
                     .order_by(ConversationEventRecord.conversation_id.asc(), ConversationEventRecord.created_at.asc())
                 ).all()
             )
