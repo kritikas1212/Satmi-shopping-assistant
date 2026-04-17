@@ -145,7 +145,8 @@ export type DashboardSnapshotResponse = {
   };
 };
 
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL || "http://127.0.0.1:8000";
+const API_BASE_URL =
+  (process.env.NEXT_PUBLIC_API_BASE_URL || (process.env.NODE_ENV !== "production" ? "http://127.0.0.1:8000" : "")).trim();
 const REQUEST_TIMEOUT_MS = Number(process.env.NEXT_PUBLIC_API_TIMEOUT_MS || 12000);
 const API_KEY = process.env.NEXT_PUBLIC_SATMI_API_KEY;
 
@@ -154,8 +155,15 @@ function normalizeBaseUrl(url: string): string {
 }
 
 function getApiBaseUrlCandidates(): string[] {
-  const configured = normalizeBaseUrl(API_BASE_URL);
-  const candidates = [configured, "http://127.0.0.1:8000", "http://localhost:8000"].map(normalizeBaseUrl);
+  const configured = API_BASE_URL ? normalizeBaseUrl(API_BASE_URL) : "";
+
+  if (process.env.NODE_ENV === "production") {
+    return configured ? [configured] : [];
+  }
+
+  const candidates = [configured, "http://127.0.0.1:8000", "http://localhost:8000"]
+    .map(normalizeBaseUrl)
+    .filter(Boolean);
   return [...new Set(candidates)];
 }
 
@@ -171,6 +179,11 @@ function isRecoverableNetworkError(error: unknown): boolean {
 
 async function fetchWithBaseFallback(path: string, init: RequestInit): Promise<Response> {
   const candidates = getApiBaseUrlCandidates();
+  if (candidates.length === 0) {
+    console.error("SATMI API base URL is not configured for this environment.");
+    throw new Error("Service is temporarily unavailable. Please try again.");
+  }
+
   let lastError: unknown;
 
   for (let index = 0; index < candidates.length; index += 1) {
@@ -194,19 +207,22 @@ async function fetchWithBaseFallback(path: string, init: RequestInit): Promise<R
         throw error;
       }
       if (index === candidates.length - 1) {
-        const attempted = candidates.join(", ");
-        throw new Error(
-          `Unable to reach SATMI backend. Tried: ${attempted}. Ensure API is running and NEXT_PUBLIC_API_BASE_URL is correct.`
-        );
+        console.error("Unable to reach SATMI backend.", {
+          attemptedBaseUrls: candidates,
+          cause: error,
+        });
+        throw new Error("Service is temporarily unavailable. Please try again.");
       }
     } finally {
       clearTimeout(timeoutId);
     }
   }
 
-  throw lastError instanceof Error
-    ? lastError
-    : new Error("Unable to reach SATMI backend via configured API base URLs.");
+  console.error("Unexpected API connectivity failure.", {
+    attemptedBaseUrls: candidates,
+    cause: lastError,
+  });
+  throw new Error("Service is temporarily unavailable. Please try again.");
 }
 
 function buildBaseHeaders(): Record<string, string> {
