@@ -101,7 +101,7 @@ export default function DashboardPage() {
         setLoadState("ready");
       } catch (err: any) {
         console.error("Dashboard load failed:", err);
-        setError(err?.message || "Failed to load dashboard data.");
+        setError("Unable to load dashboard data right now. Please try again in a moment.");
         setLoadState("error");
       }
     }
@@ -125,7 +125,7 @@ export default function DashboardPage() {
         setTranscriptData(res.transcript);
       } catch (err: any) {
         console.error("Failed to load transcript:", err);
-        setTranscriptError(err?.message || "Failed to load transcript.");
+        setTranscriptError("Unable to load transcript right now. Please try again.");
       } finally {
         setIsTranscriptLoading(false);
       }
@@ -188,7 +188,7 @@ export default function DashboardPage() {
       URL.revokeObjectURL(url);
     } catch (err: any) {
       console.error("Dashboard export failed:", err);
-      setError(err?.message || "Failed to export chat data.");
+      setError("Unable to export chat data right now. Please try again.");
     } finally {
       setIsExporting(false);
     }
