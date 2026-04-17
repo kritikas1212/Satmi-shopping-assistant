@@ -28,11 +28,20 @@ from satmi_agent.observability import (
 from satmi_agent.persistence import engine, persistence_service
 from satmi_agent.queueing import cancellation_queue_service
 from satmi_agent.schemas import (
+    ChatTranscriptResponse,
     AdminChatHistoryEvent,
     AsyncTaskResponse,
     ChatRequest,
     ChatResponse,
     ConversationEventResponse,
+    DashboardAnalyticsSummary,
+    DashboardCategorySlice,
+    DashboardChatMessage,
+    DashboardChatSession,
+    DashboardExportRow,
+    DashboardIntentSlice,
+    DashboardSnapshotResponse,
+    DashboardTopTrend,
     HandoffStatusUpdateRequest,
     IntentTrendPoint,
     HandoffTicketResponse,
@@ -661,6 +670,54 @@ def admin_chat_history(
     ]
 
 
+@app.get("/admin/dashboard/snapshot", response_model=DashboardSnapshotResponse)
+def admin_dashboard_snapshot(
+    limit: int = Query(default=10, ge=1, le=150),
+    offset: int = Query(default=0, ge=0),
+    _: None = Depends(require_support_role),
+) -> DashboardSnapshotResponse:
+    _ensure_admin_analytics_enabled()
+    snapshot = persistence_service.list_dashboard_chat_sessions(limit=limit, offset=offset)
+
+    chats = [
+        DashboardChatSession(
+            conversation_id=row["conversation_id"],
+            user_id_hash=row["user_id_hash"],
+            is_frustrated=bool(row["is_frustrated"]),
+            status=row["status"],
+            dominant_category=row["dominant_category"],
+            dominant_intent=row.get("dominant_intent", "General Inquiry"),
+            started_at=row["started_at"],
+            last_activity_at=row["last_activity_at"],
+        )
+        for row in snapshot.get("sessions", [])
+    ]
+
+    analytics = DashboardAnalyticsSummary(
+        resolution_rate=float(snapshot.get("resolution_rate", 0.0)),
+        category_divide=[DashboardCategorySlice(**item) for item in snapshot.get("category_divide", [])],
+        intent_breakdown=[DashboardIntentSlice(**item) for item in snapshot.get("intent_breakdown", [])],
+        top_trending_terms=[DashboardTopTrend(**item) for item in snapshot.get("top_trending_terms", [])],
+    )
+
+    return DashboardSnapshotResponse(
+        total_sessions=snapshot.get("total_sessions", 0),
+        chats=chats,
+        analytics=analytics
+    )
+
+
+@app.get("/admin/dashboard/export", response_model=list[DashboardExportRow])
+def admin_dashboard_export(
+    limit: int = Query(default=10, ge=1, le=150),
+    offset: int = Query(default=0, ge=0),
+    _: None = Depends(require_support_role),
+) -> list[DashboardExportRow]:
+    _ensure_admin_analytics_enabled()
+    rows = persistence_service.list_dashboard_export_rows(limit=limit, offset=offset)
+    return [DashboardExportRow(**row) for row in rows]
+
+
 @app.get("/tasks/{task_id}", response_model=AsyncTaskResponse)
 def get_async_task(task_id: str, _: None = Depends(require_support_role)) -> AsyncTaskResponse:
     task = persistence_service.get_async_task(task_id)
@@ -815,4 +872,26 @@ def resume_handoff(
         confidence=resumed_confidence,
         handoff_id=handoff_id,
         metadata={"handoff_status": "resolved", "resolution_note": scrub_pii(updated.resolution_note)},
+    )
+
+
+@app.get("/admin/dashboard/chat/{conversation_id}/transcript", response_model=ChatTranscriptResponse)
+def admin_chat_transcript(
+    conversation_id: str,
+    _: None = Depends(require_support_role),
+) -> ChatTranscriptResponse:
+    _ensure_admin_analytics_enabled()
+    transcript = persistence_service.get_chat_transcript(conversation_id)
+
+    return ChatTranscriptResponse(
+        conversation_id=conversation_id,
+        transcript=[
+            DashboardChatMessage(
+                role=item["role"],
+                message=scrub_pii(item["message"]),
+                created_at=item["created_at"],
+                intent=item.get("intent"),
+            )
+            for item in transcript
+        ]
     )

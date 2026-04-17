@@ -75,23 +75,151 @@ export type AdminChatHistoryEvent = {
   created_at: string;
 };
 
+export type ConversationEventResponse = {
+  role: string;
+  message: string;
+  status: string;
+  intent?: string | null;
+  confidence?: number | null;
+  action?: string | null;
+  handoff_id?: string | null;
+  metadata?: Record<string, unknown>;
+  created_at: string;
+};
+
+export type DashboardChatMessage = {
+  role: "user" | "assistant" | "system";
+  message: string;
+  created_at: string;
+  intent?: string | null;
+};
+
+export type DashboardChatSession = {
+  conversation_id: string;
+  user_id_hash: string;
+  is_frustrated: boolean;
+  status: "Resolved" | "Abandoned";
+  dominant_category: "Order Tracking" | "Product Search" | "Returns" | "Policy & FAQ" | "General";
+  dominant_intent: string;
+  started_at: string;
+  last_activity_at: string;
+};
+
+export type DashboardCategorySlice = {
+  category: "Order Tracking" | "Product Search" | "Returns" | "Policy & FAQ" | "General";
+  count: number;
+  percentage: number;
+};
+
+export type DashboardIntentSlice = {
+  intent: string;
+  count: number;
+  percentage: number;
+};
+
+export type DashboardTopTrend = {
+  term: string;
+  count: number;
+};
+
+export type DashboardExportRow = {
+  conversation_id: string;
+  user_id_hash: string;
+  session_status: string;
+  dominant_category: string;
+  dominant_intent: string;
+  role: string;
+  intent?: string | null;
+  message: string;
+  created_at: string;
+};
+
+export type DashboardSnapshotResponse = {
+  total_sessions: number;
+  chats: DashboardChatSession[];
+  analytics: {
+    resolution_rate: number;
+    category_divide: DashboardCategorySlice[];
+    intent_breakdown: DashboardIntentSlice[];
+    top_trending_terms: DashboardTopTrend[];
+  };
+};
+
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL || "http://127.0.0.1:8000";
+const REQUEST_TIMEOUT_MS = Number(process.env.NEXT_PUBLIC_API_TIMEOUT_MS || 12000);
 const API_KEY = process.env.NEXT_PUBLIC_SATMI_API_KEY;
 
-function buildAuthHeaders(idToken?: string): Record<string, string> {
-  const headers: Record<string, string> = {};
-  if (idToken) {
-    headers.Authorization = `Bearer ${idToken}`;
+function normalizeBaseUrl(url: string): string {
+  return url.replace(/\/$/, "");
+}
+
+function getApiBaseUrlCandidates(): string[] {
+  const configured = normalizeBaseUrl(API_BASE_URL);
+  const candidates = [configured, "http://127.0.0.1:8000", "http://localhost:8000"].map(normalizeBaseUrl);
+  return [...new Set(candidates)];
+}
+
+function isRecoverableNetworkError(error: unknown): boolean {
+  if (error instanceof TypeError) {
+    return true;
   }
+  if (typeof DOMException !== "undefined" && error instanceof DOMException) {
+    return error.name === "AbortError";
+  }
+  return false;
+}
+
+async function fetchWithBaseFallback(path: string, init: RequestInit): Promise<Response> {
+  const candidates = getApiBaseUrlCandidates();
+  let lastError: unknown;
+
+  for (let index = 0; index < candidates.length; index += 1) {
+    const baseUrl = candidates[index];
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
+    try {
+      const response = await fetch(`${baseUrl}${path}`, {
+        ...init,
+        signal: controller.signal,
+      });
+
+      if (index > 0 && process.env.NODE_ENV !== "production") {
+        console.warn(`Recovered API request via fallback base URL: ${baseUrl}`);
+      }
+      return response;
+    } catch (error) {
+      lastError = error;
+      if (!isRecoverableNetworkError(error)) {
+        throw error;
+      }
+      if (index === candidates.length - 1) {
+        const attempted = candidates.join(", ");
+        throw new Error(
+          `Unable to reach SATMI backend. Tried: ${attempted}. Ensure API is running and NEXT_PUBLIC_API_BASE_URL is correct.`
+        );
+      }
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  }
+
+  throw lastError instanceof Error
+    ? lastError
+    : new Error("Unable to reach SATMI backend via configured API base URLs.");
+}
+
+function buildBaseHeaders(): Record<string, string> {
+  const headers: Record<string, string> = {};
   if (API_KEY) {
     headers["X-API-Key"] = API_KEY;
   }
   return headers;
 }
 
-function buildAdminHeaders(idToken?: string, supportRole: "support_agent" | "admin" = "admin"): Record<string, string> {
+function buildAdminHeaders(supportRole: "support_agent" | "admin" = "admin"): Record<string, string> {
   return {
-    ...buildAuthHeaders(idToken),
+    ...buildBaseHeaders(),
     "X-Role": supportRole,
   };
 }
@@ -100,13 +228,12 @@ export async function postChat(params: {
   userId: string;
   conversationId: string;
   message: string;
-  idToken?: string;
 }): Promise<ChatResponse> {
-  const response = await fetch(`${API_BASE_URL}/chat`, {
+  const response = await fetchWithBaseFallback("/chat", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      ...buildAuthHeaders(params.idToken),
+      ...buildBaseHeaders(),
     },
     body: JSON.stringify({
       user_id: params.userId,
@@ -122,11 +249,34 @@ export async function postChat(params: {
   return response.json();
 }
 
-export async function getTask(taskId: string, idToken?: string): Promise<TaskResponse> {
-  const response = await fetch(`${API_BASE_URL}/tasks/${taskId}`, {
+export async function getConversationEvents(params: {
+  conversationId: string;
+  limit?: number;
+  supportRole?: "support_agent" | "admin";
+}): Promise<ConversationEventResponse[]> {
+  const search = new URLSearchParams({
+    limit: String(params.limit ?? 100),
+  });
+
+  const response = await fetchWithBaseFallback(`/conversations/${params.conversationId}/events?${search.toString()}`, {
     method: "GET",
     headers: {
-      ...buildAuthHeaders(idToken),
+      ...buildAdminHeaders(params.supportRole ?? "admin"),
+    },
+  });
+
+  if (!response.ok) {
+    throw new Error(`GET /conversations/${params.conversationId}/events failed (${response.status})`);
+  }
+
+  return response.json();
+}
+
+export async function getTask(taskId: string): Promise<TaskResponse> {
+  const response = await fetchWithBaseFallback(`/tasks/${taskId}`, {
+    method: "GET",
+    headers: {
+      ...buildBaseHeaders(),
     },
   });
 
@@ -140,17 +290,16 @@ export async function getTask(taskId: string, idToken?: string): Promise<TaskRes
 export async function getAdminTopSearchTerms(params: {
   days: number;
   limit: number;
-  idToken?: string;
   supportRole?: "support_agent" | "admin";
 }): Promise<SearchTermCount[]> {
   const search = new URLSearchParams({
     days: String(params.days),
     limit: String(params.limit),
   });
-  const response = await fetch(`${API_BASE_URL}/admin/analytics/top-search-terms?${search.toString()}`, {
+  const response = await fetchWithBaseFallback(`/admin/analytics/top-search-terms?${search.toString()}`, {
     method: "GET",
     headers: {
-      ...buildAdminHeaders(params.idToken, params.supportRole ?? "admin"),
+      ...buildAdminHeaders(params.supportRole ?? "admin"),
     },
   });
 
@@ -164,17 +313,16 @@ export async function getAdminTopSearchTerms(params: {
 export async function getAdminSearchTermTrends(params: {
   days: number;
   limitTerms: number;
-  idToken?: string;
   supportRole?: "support_agent" | "admin";
 }): Promise<SearchTermTrendPoint[]> {
   const search = new URLSearchParams({
     days: String(params.days),
     limit_terms: String(params.limitTerms),
   });
-  const response = await fetch(`${API_BASE_URL}/admin/analytics/search-term-trends?${search.toString()}`, {
+  const response = await fetchWithBaseFallback(`/admin/analytics/search-term-trends?${search.toString()}`, {
     method: "GET",
     headers: {
-      ...buildAdminHeaders(params.idToken, params.supportRole ?? "admin"),
+      ...buildAdminHeaders(params.supportRole ?? "admin"),
     },
   });
 
@@ -187,16 +335,15 @@ export async function getAdminSearchTermTrends(params: {
 
 export async function getAdminIntentTrends(params: {
   days: number;
-  idToken?: string;
   supportRole?: "support_agent" | "admin";
 }): Promise<IntentTrendPoint[]> {
   const search = new URLSearchParams({
     days: String(params.days),
   });
-  const response = await fetch(`${API_BASE_URL}/admin/analytics/intent-trends?${search.toString()}`, {
+  const response = await fetchWithBaseFallback(`/admin/analytics/intent-trends?${search.toString()}`, {
     method: "GET",
     headers: {
-      ...buildAdminHeaders(params.idToken, params.supportRole ?? "admin"),
+      ...buildAdminHeaders(params.supportRole ?? "admin"),
     },
   });
 
@@ -208,13 +355,12 @@ export async function getAdminIntentTrends(params: {
 }
 
 export async function getAdminWeeklyInsights(params?: {
-  idToken?: string;
   supportRole?: "support_agent" | "admin";
 }): Promise<WeeklyInsightCard[]> {
-  const response = await fetch(`${API_BASE_URL}/admin/analytics/weekly-insights`, {
+  const response = await fetchWithBaseFallback("/admin/analytics/weekly-insights", {
     method: "GET",
     headers: {
-      ...buildAdminHeaders(params?.idToken, params?.supportRole ?? "admin"),
+      ...buildAdminHeaders(params?.supportRole ?? "admin"),
     },
   });
 
@@ -230,7 +376,6 @@ export async function getAdminChatHistory(params: {
   limit?: number;
   offset?: number;
   userIdHash?: string;
-  idToken?: string;
   supportRole?: "support_agent" | "admin";
 }): Promise<AdminChatHistoryEvent[]> {
   const search = new URLSearchParams({
@@ -242,15 +387,88 @@ export async function getAdminChatHistory(params: {
     search.set("user_id_hash", params.userIdHash);
   }
 
-  const response = await fetch(`${API_BASE_URL}/admin/analytics/chat-history?${search.toString()}`, {
+  const response = await fetchWithBaseFallback(`/admin/analytics/chat-history?${search.toString()}`, {
     method: "GET",
     headers: {
-      ...buildAdminHeaders(params.idToken, params.supportRole ?? "admin"),
+      ...buildAdminHeaders(params.supportRole ?? "admin"),
     },
   });
 
   if (!response.ok) {
     throw new Error(`GET /admin/analytics/chat-history failed (${response.status})`);
+  }
+
+  return response.json();
+}
+
+export async function getAdminDashboardSnapshot(params?: {
+  limit?: number;
+  offset?: number;
+  supportRole?: "support_agent" | "admin";
+}): Promise<DashboardSnapshotResponse> {
+  const search = new URLSearchParams({
+    limit: String(params?.limit ?? 10),
+    offset: String(params?.offset ?? 0),
+  });
+
+  const response = await fetchWithBaseFallback(`/admin/dashboard/snapshot?${search.toString()}`, {
+    method: "GET",
+    headers: {
+      ...buildAdminHeaders(params?.supportRole ?? "admin"),
+    },
+  });
+
+  if (!response.ok) {
+    throw new Error(`GET /admin/dashboard/snapshot failed (${response.status})`);
+  }
+
+  return response.json();
+}
+
+export interface ChatTranscriptResponse {
+  conversation_id: string;
+  transcript: DashboardChatMessage[];
+}
+
+export async function getAdminDashboardExport(params?: {
+  limit?: number;
+  offset?: number;
+  supportRole?: "support_agent" | "admin";
+}): Promise<DashboardExportRow[]> {
+  const search = new URLSearchParams({
+    limit: String(params?.limit ?? 10),
+    offset: String(params?.offset ?? 0),
+  });
+
+  const response = await fetchWithBaseFallback(`/admin/dashboard/export?${search.toString()}`, {
+    method: "GET",
+    headers: {
+      ...buildAdminHeaders(params?.supportRole ?? "admin"),
+    },
+  });
+
+  if (!response.ok) {
+    throw new Error(`GET /admin/dashboard/export failed (${response.status})`);
+  }
+
+  return response.json();
+}
+
+export async function getAdminChatTranscript(conversationId: string, params?: {
+  supportRole?: "support_agent" | "admin";
+}): Promise<ChatTranscriptResponse> {
+  const response = await fetchWithBaseFallback(`/admin/dashboard/chat/${conversationId}/transcript`, {
+    method: "GET",
+    headers: {
+      ...buildAdminHeaders(params?.supportRole ?? "admin"),
+    },
+  });
+
+  if (!response.ok) {
+    if (response.status === 401 || response.status === 403) {
+      throw new Error("Unauthorized to access admin dashboard. Please contact an admin.");
+    }
+    throw new Error(`Failed to fetch chat transcript (Status: ${response.status})`);
   }
 
   return response.json();

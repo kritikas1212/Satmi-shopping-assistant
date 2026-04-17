@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
 import hashlib
+import re
 from typing import Any, Literal
 
 from sqlalchemy import JSON, Boolean, Date, DateTime, Float, Integer, String, Text, create_engine, func, select
@@ -146,6 +147,127 @@ def _normalize_database_url(url: str) -> str:
 
 engine = create_engine(_normalize_database_url(settings.database_url), future=True)
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False, autoflush=False, future=True)
+
+
+_FRUSTRATION_KEYWORDS = {"human", "agent", "wrong", "frustrated"}
+_ORDER_TRACKING_KEYWORDS = {"track", "tracking", "shipment", "shipping", "delivery", "order", "awb"}
+_PRODUCT_SEARCH_KEYWORDS = {
+    "buy",
+    "shop",
+    "product",
+    "products",
+    "recommend",
+    "price",
+    "bracelet",
+    "mala",
+    "ring",
+    "necklace",
+    "rudraksha",
+    "karungali",
+    "crystal",
+}
+_RETURNS_KEYWORDS = {"return", "returns", "refund", "exchange", "cancel", "replacement"}
+_POLICY_KEYWORDS = {
+    "policy",
+    "policies",
+    "warranty",
+    "guarantee",
+    "certified",
+    "lab",
+    "certificate",
+    "authentic",
+    "money-back",
+    "moneyback",
+}
+_TREND_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "can",
+    "for",
+    "from",
+    "i",
+    "is",
+    "it",
+    "my",
+    "of",
+    "on",
+    "or",
+    "please",
+    "the",
+    "to",
+    "what",
+    "where",
+    "with",
+}
+
+
+def _tokenize_words(text: str) -> set[str]:
+    cleaned = re.sub(r"[^a-z0-9\s]", " ", (text or "").lower())
+    return {token for token in cleaned.split() if token}
+
+
+def _extract_trend_term(text: str) -> str | None:
+    words = [token for token in _tokenize_words(text) if token not in _TREND_STOPWORDS]
+    if not words:
+        return None
+    return " ".join(words[:4])
+
+
+def _classify_message_category(text: str) -> str:
+    words = _tokenize_words(text)
+    if words.intersection(_ORDER_TRACKING_KEYWORDS):
+        return "Order Tracking"
+    if words.intersection(_RETURNS_KEYWORDS):
+        return "Returns"
+    if words.intersection(_PRODUCT_SEARCH_KEYWORDS):
+        return "Product Search"
+    if words.intersection(_POLICY_KEYWORDS):
+        return "Policy & FAQ"
+    return "General"
+
+
+def _normalize_intent(intent: str | None) -> str:
+    normalized = str(intent or "unknown").strip().lower()
+    if normalized in {"shopping", "order_tracking", "policy_brand_faq", "authentication", "general", "unknown"}:
+        return normalized
+    return "unknown"
+
+
+def _intent_to_label(intent: str | None) -> str:
+    mapping = {
+        "shopping": "Product Discovery",
+        "order_tracking": "Order Tracking",
+        "policy_brand_faq": "Policy & FAQ",
+        "authentication": "Account & Login",
+        "general": "General Inquiry",
+        "unknown": "General Inquiry",
+    }
+    return mapping[_normalize_intent(intent)]
+
+
+def _is_frustrated_session(user_messages: list[str]) -> bool:
+    for message in user_messages:
+        lowered = (message or "").lower()
+        if any(keyword in lowered for keyword in _FRUSTRATION_KEYWORDS):
+            return True
+    return False
+
+
+def _is_resolved_session(events: list[ConversationEventRecord]) -> bool:
+    for event in events:
+        if event.role not in {"assistant", "system"}:
+            continue
+        action = str(event.action or "").lower()
+        message = str(event.message or "").lower()
+
+        # Mark resolved if assistant completed tracking flow or presented Select & Buy product CTA.
+        if action in {"order_tracking_redirect", "portal_redirect"}:
+            return True
+        if "select & buy" in message or "select and buy" in message:
+            return True
+    return False
 
 
 class PersistenceService:
@@ -696,6 +818,297 @@ class PersistenceService:
 
         paged = normalized[offset : offset + max(limit, 1)]
         return paged
+
+    def list_dashboard_chat_sessions(self, *, limit: int = 150, offset: int = 0) -> dict[str, Any]:
+        target_limit = max(min(limit, 150), 1)
+        target_offset = max(offset, 0)
+        category_labels = ["Order Tracking", "Product Search", "Returns", "Policy & FAQ", "General"]
+        intent_labels = ["Product Discovery", "Order Tracking", "Policy & FAQ", "Account & Login", "General Inquiry"]
+
+        with self._session() as session:
+            # Get total number of sessions
+            total_sessions = session.scalar(
+                select(func.count(func.distinct(ConversationEventRecord.conversation_id)))
+            ) or 0
+
+            # Get overall intent breakdowns
+            global_intents = session.execute(
+                select(ConversationEventRecord.intent, func.count())
+                .where(ConversationEventRecord.role == "assistant")
+                .where(ConversationEventRecord.intent.is_not(None))
+                .group_by(ConversationEventRecord.intent)
+            ).all()
+
+            global_intent_counts = {label: 0 for label in intent_labels}
+            global_intent_total = 0
+            for db_intent, count in global_intents:
+                label = _intent_to_label(db_intent)
+                global_intent_counts[label] += count
+                global_intent_total += count
+
+            # Add defaults if nothing exists
+            if global_intent_total == 0:
+                global_intent_counts["General Inquiry"] += 1
+                global_intent_total += 1
+
+            recent_sessions_subquery = (
+                select(
+                    ConversationEventRecord.conversation_id.label("conversation_id"),
+                    func.max(ConversationEventRecord.created_at).label("last_activity_at"),
+                )
+                .group_by(ConversationEventRecord.conversation_id)
+                .order_by(func.max(ConversationEventRecord.created_at).desc())
+                .limit(target_limit)
+                .offset(target_offset)
+                .subquery()
+            )
+
+            session_rows = session.execute(
+                select(
+                    recent_sessions_subquery.c.conversation_id,
+                    recent_sessions_subquery.c.last_activity_at,
+                )
+                .order_by(recent_sessions_subquery.c.last_activity_at.desc())
+            ).all()
+
+            if not session_rows:
+                return {
+                    "total_sessions": 0,
+                    "sessions": [],
+                    "resolution_rate": 0.0,
+                    "category_divide": [
+                        {"category": "Order Tracking", "count": 0, "percentage": 0.0},
+                        {"category": "Product Search", "count": 0, "percentage": 0.0},
+                        {"category": "Returns", "count": 0, "percentage": 0.0},
+                        {"category": "Policy & FAQ", "count": 0, "percentage": 0.0},
+                        {"category": "General", "count": 0, "percentage": 0.0},
+                    ],
+                    "intent_breakdown": [
+                        {"intent": "Product Discovery", "count": 0, "percentage": 0.0},
+                        {"intent": "Order Tracking", "count": 0, "percentage": 0.0},
+                        {"intent": "Policy & FAQ", "count": 0, "percentage": 0.0},
+                        {"intent": "Account & Login", "count": 0, "percentage": 0.0},
+                        {"intent": "General Inquiry", "count": 0, "percentage": 0.0},
+                    ],
+                    "top_trending_terms": [],
+                }
+
+            conversation_ids = [str(row.conversation_id) for row in session_rows]
+            rows = list(
+                session.scalars(
+                    select(ConversationEventRecord)
+                    .where(ConversationEventRecord.conversation_id.in_(conversation_ids))
+                    .where(ConversationEventRecord.role.in_(["user", "assistant", "system"]))
+                    .order_by(ConversationEventRecord.created_at.asc())
+                ).all()
+            )
+
+        by_conversation: dict[str, list[ConversationEventRecord]] = {cid: [] for cid in conversation_ids}
+        for row in rows:
+            by_conversation.setdefault(row.conversation_id, []).append(row)
+
+        last_activity_lookup = {
+            str(row.conversation_id): row.last_activity_at for row in session_rows if row.last_activity_at is not None
+        }
+
+        sessions: list[dict[str, Any]] = []
+        resolved_count = 0
+        category_totals = {
+            "Order Tracking": 0,
+            "Product Search": 0,
+            "Returns": 0,
+            "Policy & FAQ": 0,
+            "General": 0,
+        }
+        intent_totals = {label: 0 for label in intent_labels}
+        trend_counts: dict[str, int] = {}
+
+        for conversation_id in conversation_ids:
+            events = by_conversation.get(conversation_id, [])
+            if not events:
+                continue
+
+            user_messages = [str(event.message or "") for event in events if event.role == "user"]
+            user_id = next((str(event.user_id or "") for event in events if event.user_id), "unknown")
+            user_id_hash = hashlib.sha256(user_id.encode("utf-8")).hexdigest()[:32]
+
+            category_counts = {
+                "Order Tracking": 0,
+                "Product Search": 0,
+                "Returns": 0,
+                "Policy & FAQ": 0,
+                "General": 0,
+            }
+            session_intent_counts = {label: 0 for label in intent_labels}
+            for message in user_messages:
+                category = _classify_message_category(message)
+                category_counts[category] += 1
+                category_totals[category] += 1
+
+                trend_term = _extract_trend_term(message)
+                if trend_term:
+                    trend_counts[trend_term] = trend_counts.get(trend_term, 0) + 1
+
+            for event in events:
+                if event.role != "assistant":
+                    continue
+                label = _intent_to_label(event.intent)
+                session_intent_counts[label] += 1
+                intent_totals[label] += 1
+
+            dominant_category = max(category_counts.items(), key=lambda item: item[1])[0]
+            if all(count == 0 for count in category_counts.values()):
+                dominant_category = "General"
+
+            if sum(session_intent_counts.values()) == 0:
+                inferred_label = _intent_to_label(
+                    "policy_brand_faq"
+                    if dominant_category == "Policy & FAQ"
+                    else "shopping"
+                    if dominant_category == "Product Search"
+                    else "order_tracking"
+                    if dominant_category == "Order Tracking"
+                    else "general"
+                )
+                session_intent_counts[inferred_label] += 1
+                intent_totals[inferred_label] += 1
+
+            dominant_intent = max(session_intent_counts.items(), key=lambda item: item[1])[0]
+
+            is_frustrated = _is_frustrated_session(user_messages)
+            is_resolved = _is_resolved_session(events)
+            session_status = "Resolved" if is_resolved else "Abandoned"
+            if is_resolved:
+                resolved_count += 1
+
+            started_at = events[0].created_at.isoformat()
+            last_activity = last_activity_lookup.get(conversation_id)
+            last_activity_at = last_activity.isoformat() if last_activity else events[-1].created_at.isoformat()
+
+            sessions.append(
+                {
+                    "conversation_id": conversation_id,
+                    "user_id_hash": user_id_hash,
+                    "is_frustrated": is_frustrated,
+                    "status": session_status,
+                    "dominant_category": dominant_category,
+                    "dominant_intent": dominant_intent,
+                    "started_at": started_at,
+                    "last_activity_at": last_activity_at,
+                }
+            )
+
+        sessions.sort(key=lambda row: row["last_activity_at"], reverse=True)
+        # Using real global count instead of just the paginated session count
+        
+        total_categorized_messages = sum(category_totals.values())
+
+        category_divide = []
+        for category in category_labels:
+            count = category_totals[category]
+            percentage = 0.0
+            if total_categorized_messages > 0:
+                percentage = round((count / total_categorized_messages) * 100.0, 2)
+            category_divide.append(
+                {
+                    "category": category,
+                    "count": count,
+                    "percentage": percentage,
+                }
+            )
+
+        intent_breakdown = []
+        for intent in intent_labels:
+            count = global_intent_counts[intent]
+            percentage = 0.0
+            if global_intent_total > 0:
+                percentage = round((count / global_intent_total) * 100.0, 2)
+            intent_breakdown.append(
+                {
+                    "intent": intent,
+                    "count": count,
+                    "percentage": percentage,
+                }
+            )
+
+        top_trending_terms = [
+            {"term": term, "count": count}
+            for term, count in sorted(trend_counts.items(), key=lambda item: item[1], reverse=True)[:10]
+        ]
+
+        resolution_rate = 0.0
+        if len(sessions) > 0:
+            resolution_rate = round((resolved_count / len(sessions)) * 100.0, 2)
+
+        return {
+            "total_sessions": total_sessions,
+            "sessions": sessions,
+            "resolution_rate": resolution_rate,
+            "category_divide": category_divide,
+            "intent_breakdown": intent_breakdown,
+            "top_trending_terms": top_trending_terms,
+        }
+
+
+    def get_chat_transcript(self, conversation_id: str) -> list[dict[str, Any]]:
+        with self._session() as session:
+            rows = session.scalars(
+                select(ConversationEventRecord)
+                .where(ConversationEventRecord.conversation_id == conversation_id)
+                .where(ConversationEventRecord.role.in_(["user", "assistant", "system"]))
+                .order_by(ConversationEventRecord.created_at.asc())
+            ).all()
+
+        return [
+            {
+                "role": event.role,
+                "message": event.message,
+                "created_at": event.created_at.isoformat(),
+                "intent": _intent_to_label(event.intent) if event.intent else None,
+            }
+            for event in rows
+        ]
+
+    def list_dashboard_export_rows(self, *, limit: int = 150, offset: int = 0) -> list[dict[str, Any]]:
+        snapshot = self.list_dashboard_chat_sessions(limit=limit, offset=offset)
+        sessions = snapshot.get("sessions", [])
+        if not sessions:
+            return []
+
+        session_lookup = {item["conversation_id"]: item for item in sessions}
+        conversation_ids = list(session_lookup.keys())
+
+        with self._session() as session:
+            events = list(
+                session.scalars(
+                    select(ConversationEventRecord)
+                    .where(ConversationEventRecord.conversation_id.in_(conversation_ids))
+                    .where(ConversationEventRecord.role.in_(["user", "assistant", "system"]))
+                    .order_by(ConversationEventRecord.conversation_id.asc(), ConversationEventRecord.created_at.asc())
+                ).all()
+            )
+
+        rows: list[dict[str, Any]] = []
+        for event in events:
+            session_info = session_lookup.get(event.conversation_id)
+            if not session_info:
+                continue
+
+            rows.append(
+                {
+                    "conversation_id": event.conversation_id,
+                    "user_id_hash": session_info["user_id_hash"],
+                    "session_status": session_info["status"],
+                    "dominant_category": session_info["dominant_category"],
+                    "dominant_intent": session_info["dominant_intent"],
+                    "role": event.role,
+                    "intent": _intent_to_label(event.intent) if event.intent else None,
+                    "message": scrub_pii(event.message),
+                    "created_at": event.created_at.isoformat(),
+                }
+            )
+
+        return rows
 
 
 persistence_service = PersistenceService()
