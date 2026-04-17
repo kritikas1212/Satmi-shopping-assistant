@@ -145,6 +145,40 @@ export type DashboardSnapshotResponse = {
   };
 };
 
+function normalizeDashboardSnapshot(payload: unknown): DashboardSnapshotResponse {
+  const input = (payload && typeof payload === "object") ? (payload as Record<string, unknown>) : {};
+
+  const chats = Array.isArray(input.chats) ? (input.chats as DashboardChatSession[]) : [];
+
+  const analyticsInput =
+    input.analytics && typeof input.analytics === "object"
+      ? (input.analytics as Record<string, unknown>)
+      : {};
+
+  const resolutionRateRaw = analyticsInput.resolution_rate;
+  const resolutionRate =
+    typeof resolutionRateRaw === "number" && Number.isFinite(resolutionRateRaw)
+      ? resolutionRateRaw
+      : 0;
+
+  return {
+    total_sessions: typeof input.total_sessions === "number" ? input.total_sessions : chats.length,
+    chats,
+    analytics: {
+      resolution_rate: resolutionRate,
+      category_divide: Array.isArray(analyticsInput.category_divide)
+        ? (analyticsInput.category_divide as DashboardCategorySlice[])
+        : [],
+      intent_breakdown: Array.isArray(analyticsInput.intent_breakdown)
+        ? (analyticsInput.intent_breakdown as DashboardIntentSlice[])
+        : [],
+      top_trending_terms: Array.isArray(analyticsInput.top_trending_terms)
+        ? (analyticsInput.top_trending_terms as DashboardTopTrend[])
+        : [],
+    },
+  };
+}
+
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL || "http://127.0.0.1:8000";
 const REQUEST_TIMEOUT_MS = Number(process.env.NEXT_PUBLIC_API_TIMEOUT_MS || 12000);
 const API_KEY = process.env.NEXT_PUBLIC_SATMI_API_KEY;
@@ -422,7 +456,8 @@ export async function getAdminDashboardSnapshot(params?: {
     throw new Error(`GET /admin/dashboard/snapshot failed (${response.status})`);
   }
 
-  return response.json();
+  const payload = await response.json();
+  return normalizeDashboardSnapshot(payload);
 }
 
 export interface ChatTranscriptResponse {

@@ -84,6 +84,10 @@ export default function DashboardPage() {
   const [transcriptError, setTranscriptError] = useState<string | null>(null);
   const [isExporting, setIsExporting] = useState(false);
 
+  const safeResolutionRate = Number.isFinite(data?.analytics?.resolution_rate)
+    ? Number(data?.analytics?.resolution_rate)
+    : 0;
+
   useEffect(() => {
     async function load() {
       setLoadState("loading");
@@ -225,7 +229,7 @@ export default function DashboardPage() {
             </div>
             <div className="rounded-xl border border-[#D7C5B5] bg-white p-5 shadow-sm">
               <p className="text-xs font-semibold uppercase text-[#475569]">Resolution Rate</p>
-              <p className="mt-2 text-3xl font-bold text-[#0F766E]">{data.analytics.resolution_rate.toFixed(1)}%</p>
+              <p className="mt-2 text-3xl font-bold text-[#0F766E]">{safeResolutionRate.toFixed(1)}%</p>
             </div>
             <div className="rounded-xl border border-[#D7C5B5] bg-white p-5 shadow-sm">
               <p className="text-xs font-semibold uppercase text-[#475569]">Filtered Conversations</p>
