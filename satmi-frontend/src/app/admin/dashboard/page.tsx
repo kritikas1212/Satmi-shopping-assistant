@@ -3,7 +3,7 @@
 export const dynamic = "force-dynamic";
 
 import { useEffect, useMemo, useState } from "react";
-import dynamic from "next/dynamic";
+import nextDynamic from "next/dynamic";
 import { MoreVertical, User } from "lucide-react";
 import {
   DashboardChatMessage,
@@ -20,12 +20,12 @@ import { onAuthStateChanged, signOut } from "firebase/auth";
 import { auth } from "@/lib/firebase";
 import { useRouter } from "next/navigation";
 
-const CategoryPieChart = dynamic(() => import("./components/CategoryPieChart"), {
+const CategoryPieChart = nextDynamic(() => import("./components/CategoryPieChart"), {
   ssr: false,
   loading: () => <div className="text-sm text-[#475569]">Loading chart...</div>,
 });
 
-const UserActivityChart = dynamic(() => import("./components/UserActivityChart"), {
+const UserActivityChart = nextDynamic(() => import("./components/UserActivityChart"), {
   ssr: false,
   loading: () => <div className="text-sm text-[#475569]">Loading graph...</div>,
 });
