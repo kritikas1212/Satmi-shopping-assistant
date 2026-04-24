@@ -1,5 +1,7 @@
 "use client";
 
+export const dynamic = "force-dynamic";
+
 import { useEffect, useMemo, useState } from "react";
 import dynamic from "next/dynamic";
 import { MoreVertical, User } from "lucide-react";
