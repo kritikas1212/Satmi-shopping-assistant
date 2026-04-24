@@ -33,5 +33,26 @@
     "tags": ["human", "agent", "escalate", "handoff"],
     "title": "Manual escalation policy",
     "content": "If a customer requests a human agent or policy confidence is low, create a handoff ticket immediately and preserve full audit history."
+  },
+  {
+    "id": "spiritual_karungali_mala",
+    "intent": "shopping",
+    "tags": ["karungali", "mala", "ebony", "protection", "mars", "mangal", "dosha", "spiritual"],
+    "title": "Karungali Mala (Sacred Black Wood)",
+    "content": "Karungali mala is a holy necklace made from black ebony wood, sourced from the heartwood of the Karungali tree. It is deeply rooted in Tamil spiritual tradition and provides subtle protection throughout the day. It acts as a shield against negative external influences like the 'evil eye' or 'black magic'. Astrologically, it balances Planet Mars (Mangal) and is recommended for Mars Dosha. It brings prosperity, success, focus, calmness, and supports spiritual growth. DOS: Touch only with clean hands. Store safely with intention and respect. Start wearing on auspicious days with a calm mindset. DON'TS: Remove during bathing, sleep, and intimacy (as its energy is masculine and protective and must maintain sacred vibration). Avoid non-veg food and alcohol while wearing."
+  },
+  {
+    "id": "spiritual_healing_crystals",
+    "intent": "shopping",
+    "tags": ["crystals", "stones", "healing", "agate", "amethyst", "aventurine", "citrine", "fluorite", "hematite", "jasper", "lapis", "lava", "moonstone", "obsidian", "onyx", "pyrite", "quartz", "sodalite", "sunstone", "tiger eye", "tourmaline"],
+    "title": "Healing Crystals & Stones Guide",
+    "content": "Agate: Grounding, emotional healing, sleep, financial discipline. Amethyst: Calm mind, anxiety relief, sleep, spiritual growth. Aventurine: Calm, prosperity, luck, heart chakra. Citrine: Positivity, wealth, success, motivation. Fluorite: Mental clarity, focus, energy protection. Hematite: Focus, grounding, stress control. Jasper: Emotional stability, stamina. Lapis Lazuli: Mental clarity, honest expression. Lava Stone: Grounding, personal transformation. Moonstone: Lunar balance, empathy. Obsidian: Emotional healing, energy cleansing. Onyx: Protection, emotional strength. Pyrite: Confidence, motivation, wealth. Quartz: Energy amplification, space cleansing. Sodalite: Focus, clear communication. Sunstone: Self-confidence, luck. Tiger's Eye: Courage, decision-making. Tourmaline: Anxiety relief, emotional protection."
+  },
+  {
+    "id": "spiritual_rudraksha_guide",
+    "intent": "shopping",
+    "tags": ["rudraksha", "mukhi", "shiva", "spiritual", "beads", "seeds", "ganesh", "gauri shankar"],
+    "title": "Rudraksha Mukhi Guide",
+    "content": "Rudraksha beads are dried seeds of the Elaeocarpus ganitrus tree, legendarily from Lord Shiva's tears. They have electromagnetic properties that stabilize heart rate and reduce stress. MUKHIS (Faces): 1 Mukhi (Shiva): Spiritual awakening. 2 Mukhi (Ardhanarishwar): Emotional/relationship balance. 3 Mukhi (Agni): Transformation. 4 Mukhi (Brahma): Knowledge/focus. 5 Mukhi (Rudra): Health, peace of mind (Most common). 6 Mukhi (Kartikeya): Willpower. 7 Mukhi (Laxmi): Wealth, abundance. 8 Mukhi (Ganesha): Obstacle removal. 9 Mukhi (Nav Durga): Power, protection. 10 Mukhi (Vishnu): Harmony. 11 Mukhi (Hanuman): Courage, protection. 12 Mukhi (Suryadev): Leadership. 13 Mukhi (Kamdev): Attraction. 14 Mukhi (Shiva/Kuber): Intuition. Ganesh Mukhi: Wisdom. Gauri Shankar: Divine union, relationship harmony."
   }
 ]

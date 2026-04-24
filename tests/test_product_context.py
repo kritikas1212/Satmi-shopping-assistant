@@ -25,6 +25,7 @@ def test_metrics_endpoint_enabled(client):
 
 
 def test_product_search_response_inr_format(monkeypatch, client):
+    monkeypatch.setattr("satmi_agent.nodes.classify_intent_with_llm", lambda **kwargs: ("shopping", 1.0))
     # Mock the search tool result to keep response deterministic.
     def fake_search_products(query: str):
         return {
@@ -69,6 +70,7 @@ def test_product_search_response_inr_format(monkeypatch, client):
 
 
 def test_product_search_stub_fallback_source_is_graceful(monkeypatch, client):
+    monkeypatch.setattr("satmi_agent.nodes.classify_intent_with_llm", lambda **kwargs: ("shopping", 1.0))
     def fake_search_products(query: str):
         return {
             "query": query,

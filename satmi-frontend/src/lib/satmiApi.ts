@@ -92,6 +92,7 @@ export type DashboardChatMessage = {
   message: string;
   created_at: string;
   intent?: string | null;
+  event_metadata?: Record<string, unknown>;
 };
 
 export type DashboardChatSession = {
@@ -101,6 +102,17 @@ export type DashboardChatSession = {
   status: "Resolved" | "Abandoned";
   dominant_category: "Order Tracking" | "Product Search" | "Returns" | "Policy & FAQ" | "General";
   dominant_intent: string;
+  intent_confidence?: number | null;
+  intent_model_name?: string | null;
+  intent_model_version?: string | null;
+  intent_source_version?: string | null;
+  intent_needs_review?: boolean | null;
+  intent_is_overridden?: boolean;
+  intent_override_reason?: string | null;
+  intent_raw_label?: string | null;
+  intent_classifier_mode?: string | null;
+  intent_classifier_error?: string | null;
+  intent_classifier_total_tokens?: number | null;
   started_at: string;
   last_activity_at: string;
 };
@@ -117,6 +129,12 @@ export type DashboardIntentSlice = {
   percentage: number;
 };
 
+export type DashboardIntentSubcategorySlice = {
+  parent_intent: string;
+  subcategory: string;
+  count: number;
+};
+
 export type DashboardTopTrend = {
   term: string;
   count: number;
@@ -128,10 +146,45 @@ export type DashboardExportRow = {
   session_status: string;
   dominant_category: string;
   dominant_intent: string;
+  intent_confidence?: number | null;
+  intent_model_version?: string | null;
+  intent_raw_label?: string | null;
+  intent_classifier_mode?: string | null;
   role: string;
   intent?: string | null;
   message: string;
   created_at: string;
+};
+
+export type ConversationIntentOverrideResponse = {
+  conversation_id: string;
+  saved?: boolean;
+  cleared?: boolean;
+  label?: Record<string, unknown> | null;
+};
+
+export type IntentClassifierBackfillResponse = {
+  queued: number;
+  limit: number;
+  inactive_minutes: number;
+};
+
+export type ConversationIntentBackfillResponse = {
+  conversation_id: string;
+  status?: "queued" | "completed";
+  queued?: boolean;
+  task_id?: string | null;
+  result?: Record<string, unknown>;
+};
+
+export type DeleteConversationResponse = {
+  conversation_id: string;
+  deleted: Record<string, number>;
+};
+
+export type DashboardDailyActivity = {
+  date: string;
+  sessions: number;
 };
 
 export type DashboardSnapshotResponse = {
@@ -139,15 +192,18 @@ export type DashboardSnapshotResponse = {
   chats: DashboardChatSession[];
   analytics: {
     resolution_rate: number;
+    recommendation_conversions: number;
     category_divide: DashboardCategorySlice[];
     intent_breakdown: DashboardIntentSlice[];
+    intent_subcategory_breakdown?: DashboardIntentSubcategorySlice[];
     top_trending_terms: DashboardTopTrend[];
+    daily_activity: DashboardDailyActivity[];
   };
 };
 
 const API_BASE_URL =
   (process.env.NEXT_PUBLIC_API_BASE_URL || (process.env.NODE_ENV !== "production" ? "http://127.0.0.1:8000" : "")).trim();
-const REQUEST_TIMEOUT_MS = Number(process.env.NEXT_PUBLIC_API_TIMEOUT_MS || 12000);
+const REQUEST_TIMEOUT_MS = Number(process.env.NEXT_PUBLIC_API_TIMEOUT_MS || 60000);
 const API_KEY = process.env.NEXT_PUBLIC_SATMI_API_KEY;
 
 function normalizeBaseUrl(url: string): string {
@@ -420,12 +476,16 @@ export async function getAdminChatHistory(params: {
 export async function getAdminDashboardSnapshot(params?: {
   limit?: number;
   offset?: number;
+  startDate?: string | null;
+  endDate?: string | null;
   supportRole?: "support_agent" | "admin";
 }): Promise<DashboardSnapshotResponse> {
   const search = new URLSearchParams({
     limit: String(params?.limit ?? 10),
     offset: String(params?.offset ?? 0),
   });
+  if (params?.startDate) search.set("start_date", params.startDate);
+  if (params?.endDate) search.set("end_date", params.endDate);
 
   const response = await fetchWithBaseFallback(`/admin/dashboard/snapshot?${search.toString()}`, {
     method: "GET",
@@ -485,6 +545,155 @@ export async function getAdminChatTranscript(conversationId: string, params?: {
       throw new Error("Unauthorized to access admin dashboard. Please contact an admin.");
     }
     throw new Error(`Failed to fetch chat transcript (Status: ${response.status})`);
+  }
+
+  return response.json();
+}
+
+export async function setAdminConversationIntentOverride(params: {
+  conversationId: string;
+  intentLabel: string;
+  overrideReason: string;
+  overriddenBy?: string;
+  supportRole?: "support_agent" | "admin";
+}): Promise<ConversationIntentOverrideResponse> {
+  const response = await fetchWithBaseFallback(`/admin/dashboard/chat/${params.conversationId}/intent-override`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...buildAdminHeaders(params.supportRole ?? "admin"),
+    },
+    body: JSON.stringify({
+      intent_label: params.intentLabel,
+      override_reason: params.overrideReason,
+      overridden_by: params.overriddenBy,
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`POST /admin/dashboard/chat/${params.conversationId}/intent-override failed (${response.status})`);
+  }
+
+  return response.json();
+}
+
+export async function clearAdminConversationIntentOverride(params: {
+  conversationId: string;
+  supportRole?: "support_agent" | "admin";
+}): Promise<ConversationIntentOverrideResponse> {
+  const response = await fetchWithBaseFallback(`/admin/dashboard/chat/${params.conversationId}/intent-override`, {
+    method: "DELETE",
+    headers: {
+      ...buildAdminHeaders(params.supportRole ?? "admin"),
+    },
+  });
+
+  if (!response.ok) {
+    throw new Error(`DELETE /admin/dashboard/chat/${params.conversationId}/intent-override failed (${response.status})`);
+  }
+
+  return response.json();
+}
+
+export async function addConversationComment(params: {
+  conversationId: string;
+  message: string;
+  supportRole?: "support_agent" | "admin";
+}): Promise<{ conversation_id: string; status: string }> {
+  const response = await fetchWithBaseFallback(`/admin/dashboard/chat/${params.conversationId}/comment`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...buildAdminHeaders(params.supportRole ?? "admin"),
+    },
+    body: JSON.stringify({ message: params.message }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`POST /admin/dashboard/chat/${params.conversationId}/comment failed (${response.status})`);
+  }
+
+  return response.json();
+}
+
+export async function deleteConversation(params: {
+  conversationId: string;
+  supportRole?: "support_agent" | "admin";
+}): Promise<DeleteConversationResponse> {
+  const response = await fetchWithBaseFallback(`/admin/dashboard/chat/${params.conversationId}`, {
+    method: "DELETE",
+    headers: {
+      ...buildAdminHeaders(params.supportRole ?? "admin"),
+    },
+  });
+
+  if (!response.ok) {
+    throw new Error(`DELETE /admin/dashboard/chat/${params.conversationId} failed (${response.status})`);
+  }
+
+  return response.json();
+}
+
+export async function triggerAdminIntentClassifierBackfill(params?: {
+  limit?: number;
+  inactiveMinutes?: number;
+  supportRole?: "support_agent" | "admin";
+}): Promise<IntentClassifierBackfillResponse> {
+  const search = new URLSearchParams({
+    limit: String(params?.limit ?? 200),
+    inactive_minutes: String(params?.inactiveMinutes ?? 15),
+  });
+
+  const response = await fetchWithBaseFallback(`/admin/dashboard/intent-classifier/backfill?${search.toString()}`, {
+    method: "POST",
+    headers: {
+      ...buildAdminHeaders(params?.supportRole ?? "admin"),
+    },
+  });
+
+  if (!response.ok) {
+    throw new Error(`POST /admin/dashboard/intent-classifier/backfill failed (${response.status})`);
+  }
+
+  return response.json();
+}
+
+export async function queueAdminConversationIntentBackfill(params: {
+  conversationId: string;
+  supportRole?: "support_agent" | "admin";
+}): Promise<ConversationIntentBackfillResponse> {
+  const response = await fetchWithBaseFallback(
+    `/admin/dashboard/chat/${params.conversationId}/intent-classifier/backfill`,
+    {
+      method: "POST",
+      headers: {
+        ...buildAdminHeaders(params.supportRole ?? "admin"),
+      },
+    },
+  );
+
+  if (!response.ok) {
+    throw new Error(
+      `POST /admin/dashboard/chat/${params.conversationId}/intent-classifier/backfill failed (${response.status})`,
+    );
+  }
+
+  return response.json();
+}
+
+export async function deleteAdminConversation(params: {
+  conversationId: string;
+  supportRole?: "support_agent" | "admin";
+}): Promise<DeleteConversationResponse> {
+  const response = await fetchWithBaseFallback(`/admin/dashboard/chat/${params.conversationId}`, {
+    method: "DELETE",
+    headers: {
+      ...buildAdminHeaders(params.supportRole ?? "admin"),
+    },
+  });
+
+  if (!response.ok) {
+    throw new Error(`DELETE /admin/dashboard/chat/${params.conversationId} failed (${response.status})`);
   }
 
   return response.json();

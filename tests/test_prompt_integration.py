@@ -59,6 +59,7 @@ def test_general_inquiry_routes_to_general_conversation(monkeypatch):
 
 
 def test_knowledge_query_routes_to_knowledge_and_search(monkeypatch):
+    monkeypatch.setattr(nodes, "classify_intent_with_llm", lambda **kwargs: ("shopping", 1.0))
     def fake_search_products(query: str):
         return {
             "query": query,
@@ -103,7 +104,7 @@ def test_general_conversation_normalizes_system_message_to_front(monkeypatch):
 
     history = state["message_history"]
     assert history[0]["role"] == "system"
-    assert "Concierge for SATMI" in history[0]["content"]
+    assert "Senior Spiritual Wellness Consultant" in history[0]["content"]
     assert sum(1 for item in history if item.get("role") == "system") == 1
 
 

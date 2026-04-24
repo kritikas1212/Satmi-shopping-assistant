@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, Literal, TypedDict
 
 
-Intent = Literal["shopping", "order_tracking", "policy_brand_faq", "general", "authentication", "unknown"]
+Intent = str
 Status = Literal["active", "awaiting_human", "resolved"]
 
 

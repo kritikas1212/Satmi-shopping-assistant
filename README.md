@@ -172,6 +172,10 @@ pip install -r requirements.txt
 - `RATE_LIMIT_REQUESTS` + `RATE_LIMIT_WINDOW_SECONDS`: limiter thresholds.
 - `SHOPIFY_TIMEOUT_SECONDS`: per-request timeout for Shopify calls.
 - `SHOPIFY_MAX_RETRIES`: retry count for transient Shopify errors and throttling.
+- `GEMINI_INTENT_CLASSIFIER_API_KEY`: optional dedicated Gemini key for conversation intent classification (falls back to `GEMINI_API_KEY` when unset).
+- `CONVERSATION_INTENT_ALLOW_HEURISTIC_FALLBACK`: if `true`, falls back to assistant-event heuristics when classifier call fails.
+- `CONVERSATION_INTENT_RAW_MODE`: if `true`, runs less constrained full-transcript classification and stores raw model label/output metadata.
+- `CONVERSATION_INTENT_RAW_DISABLE_REDACTION`: if `true` with raw mode, transcript sent to classifier is not PII-scrubbed.
 
 ## Phase 5 Validation
 

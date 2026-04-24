@@ -354,9 +354,9 @@ def _contains_authentication_intent(message: str) -> bool:
     return any(re.search(pattern, lowered) for pattern in AUTHENTICATION_INTENT_PATTERNS)
 
 
-def _extract_search_query(message: str) -> str:
+def _extract_search_query(message: str, policy_context: list[dict[str, str]] | None = None) -> str:
     """Extract a cleaned catalog query without over-compressing it."""
-    llm_query = extract_search_keywords_with_llm(user_message=message)
+    llm_query = extract_search_keywords_with_llm(user_message=message, policy_context=policy_context)
     if llm_query:
         cleaned_llm_query = " ".join(llm_query.split()).strip()
         return cleaned_llm_query or DEFAULT_DISCOVERY_QUERY
@@ -1107,7 +1107,9 @@ def execute_action(state: AgentState) -> AgentState:
         }
 
     action = "knowledge_and_search" if _is_knowledge_query(message) else "search_products"
-    clean_query = "Karungali Rudraksha Rose Quartz" if _is_best_sellers_query(message, _tokenize(message)) else _extract_search_query(message)
+    
+    policy_context = state.get("policy_context") or []
+    clean_query = "Karungali Rudraksha Rose Quartz" if _is_best_sellers_query(message, _tokenize(message)) else _extract_search_query(message, policy_context)
 
     # Comparison queries need results from both sides (e.g. "rose quartz" and "pyrite").
     if _is_comparison_request(message, words):
@@ -1115,7 +1117,7 @@ def execute_action(state: AgentState) -> AgentState:
         lowered = message.lower()
         split_parts = re.split(r"\b(?:vs|versus|and)\b", lowered)
         for part in split_parts:
-            extracted = _extract_search_query(part)
+            extracted = _extract_search_query(part, policy_context)
             if extracted:
                 query_parts.append(extracted)
         query_parts = [q for q in dict.fromkeys(query_parts) if q]

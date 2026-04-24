@@ -111,6 +111,18 @@ AUTH_REQUIRED=false
 LLM_PROVIDER=gemini
 MODEL_NAME=gemini-2.0-flash
 GEMINI_API_KEY=<your_real_gemini_key>
+GEMINI_INTENT_CLASSIFIER_API_KEY=<separate_classifier_key_optional>
+```
+
+Optional conversation-intent classifier controls:
+
+```env
+CONVERSATION_INTENT_CLASSIFIER_ENABLED=true
+CONVERSATION_INTENT_SHADOW_MODE=false
+CONVERSATION_INTENT_USE_LLM_PRIMARY=true
+CONVERSATION_INTENT_ALLOW_HEURISTIC_FALLBACK=false
+CONVERSATION_INTENT_RAW_MODE=true
+CONVERSATION_INTENT_RAW_DISABLE_REDACTION=false
 ```
 
 ### Shopify (required for real Shopify operations)

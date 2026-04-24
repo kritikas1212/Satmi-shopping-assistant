@@ -576,8 +576,10 @@ class ToolingService:
         normalized_results: list[dict[str, Any]] = []
         storefront_domain = self._storefront_domain()
 
-        source_products = ranked_results if ranked_results else candidate_products[: settings.catalog_search_result_limit]
-
+        if generic_discovery:
+            source_products = ranked_results if ranked_results else candidate_products[: settings.catalog_search_result_limit]
+        else:
+            source_products = ranked_results
         for item in source_products[: settings.catalog_search_result_limit]:
             # Title
             title = str(item.get("title") or item.get("name") or "SATMI Product").strip() or "SATMI Product"

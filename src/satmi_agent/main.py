@@ -93,13 +93,27 @@ async def _warm_catalog_cache() -> None:
         return
 
 
+import asyncio
+from satmi_agent.queueing import conversation_intent_queue_service
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     persistence_service.init_db()
     await _warm_catalog_cache()
     ensure_firebase_ready_or_raise()
     setup_tracing()
+    
+    # Run the background intent classifier worker inline so users don't have to run it separately
+    stop_event = asyncio.Event()
+    worker_task = asyncio.create_task(
+        asyncio.to_thread(conversation_intent_queue_service.process_queue_loop)
+    )
+    
     yield
+    
+    # Teardown
+    worker_task.cancel()
+
 
 
 app = FastAPI(title="SATMI Agent API", version="0.1.0", lifespan=lifespan)

@@ -7,6 +7,7 @@ class Settings(BaseSettings):
     llm_provider: str = "gemini"
     model_name: str = "gemini-2.5-flash"
     gemini_api_key: str | None = None
+    gemini_intent_classifier_api_key: str | None = None
     gemini_retry_count: int = 2
     gemini_strict_retry_count: int = 1
     gemini_retry_base_delay_seconds: float = 0.6
@@ -53,6 +54,22 @@ class Settings(BaseSettings):
     catalog_cache_ttl_seconds: int = 600
     catalog_cache_max_products: int = 3000
     catalog_search_result_limit: int = 8
+
+    # Conversation-level intent classifier controls
+    conversation_intent_classifier_enabled: bool = True
+    conversation_intent_shadow_mode: bool = False
+    conversation_intent_use_llm_primary: bool = True
+    conversation_intent_allow_heuristic_fallback: bool = False
+    conversation_intent_raw_mode: bool = False
+    conversation_intent_raw_disable_redaction: bool = False
+    conversation_intent_source_version: str = "conversation-intent-v1"
+    conversation_intent_inactive_minutes: int = 1
+    conversation_intent_queue_key: str = "satmi:conversation_intent:queue"
+    conversation_intent_dead_letter_key: str = "satmi:conversation_intent:dead"
+    conversation_intent_max_retries: int = 3
+    conversation_intent_backfill_batch_size: int = 200
+    conversation_intent_transcript_event_limit: int = 800
+    conversation_intent_transcript_char_limit: int = 20000
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
