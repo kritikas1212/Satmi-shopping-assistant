@@ -6,6 +6,7 @@ import hashlib
 import logging
 from pathlib import Path
 import re
+import threading
 import time
 from typing import Any
 from uuid import uuid4
@@ -93,23 +94,29 @@ async def _warm_catalog_cache() -> None:
         return
 
 
-def _run_intent_worker_loop(stop_event: asyncio.Event):
+def _run_intent_worker_loop(stop_event: threading.Event):
     import time
-    from scripts.process_conversation_intent_queue import TokenBucket, process_batch
-    
+    import sys
+    import os
+    # Ensure scripts dir is importable
+    scripts_dir = os.path.join(os.path.dirname(__file__), "..", "..", "scripts")
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, os.path.abspath(scripts_dir))
+    from process_conversation_intent_queue import TokenBucket, process_batch
+
     bucket = TokenBucket(capacity=15, fill_rate_per_sec=15.0 / 60.0)
     while not stop_event.is_set():
         if bucket.tokens < 2.0:
-            time.sleep(5.0)
+            stop_event.wait(timeout=5.0)
             continue
         try:
             processed_count = process_batch(max_batch_size=5)
             if processed_count > 0:
                 bucket.consume(1)
             else:
-                time.sleep(1.0)
+                stop_event.wait(timeout=1.0)
         except Exception as e:
-            time.sleep(5.0)
+            stop_event.wait(timeout=5.0)
 
 
 @asynccontextmanager
@@ -118,15 +125,15 @@ async def lifespan(_: FastAPI):
     await _warm_catalog_cache()
     ensure_firebase_ready_or_raise()
     setup_tracing()
-    
-    # Run the background intent classifier worker inline so users don't have to run it separately
-    stop_event = asyncio.Event()
+
+    # Run the background intent classifier worker inline
+    stop_event = threading.Event()
     worker_task = asyncio.create_task(
         asyncio.to_thread(_run_intent_worker_loop, stop_event)
     )
-    
+
     yield
-    
+
     # Teardown
     stop_event.set()
     worker_task.cancel()
