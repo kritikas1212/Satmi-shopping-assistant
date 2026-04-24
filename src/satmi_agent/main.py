@@ -93,8 +93,24 @@ async def _warm_catalog_cache() -> None:
         return
 
 
-import asyncio
-from satmi_agent.queueing import conversation_intent_queue_service
+def _run_intent_worker_loop(stop_event: asyncio.Event):
+    import time
+    from scripts.process_conversation_intent_queue import TokenBucket, process_batch
+    
+    bucket = TokenBucket(capacity=15, fill_rate_per_sec=15.0 / 60.0)
+    while not stop_event.is_set():
+        if bucket.tokens < 2.0:
+            time.sleep(5.0)
+            continue
+        try:
+            processed_count = process_batch(max_batch_size=5)
+            if processed_count > 0:
+                bucket.consume(1)
+            else:
+                time.sleep(1.0)
+        except Exception as e:
+            time.sleep(5.0)
+
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
@@ -106,12 +122,13 @@ async def lifespan(_: FastAPI):
     # Run the background intent classifier worker inline so users don't have to run it separately
     stop_event = asyncio.Event()
     worker_task = asyncio.create_task(
-        asyncio.to_thread(conversation_intent_queue_service.process_queue_loop)
+        asyncio.to_thread(_run_intent_worker_loop, stop_event)
     )
     
     yield
     
     # Teardown
+    stop_event.set()
     worker_task.cancel()
 
 
@@ -1178,13 +1195,9 @@ def reclassify_conversation_intent(
     conversation_id: str,
     _: None = Depends(require_support_role),
 ):
-    task_id = persistence_service.create_async_task(
-        task_type="conversation_intent_classification",
-        payload={"conversation_id": conversation_id, "force": True},
+    result = conversation_intent_queue_service.enqueue_classification(
+        conversation_id=conversation_id,
+        user_id="admin",
+        force=True,
     )
-    conversation_intent_queue_service.push_task({
-        "task_id": task_id,
-        "conversation_id": conversation_id,
-        "force": True,
-    })
-    return {"status": "ok", "task_id": task_id}
+    return {"status": "ok", "task_id": result["task_id"]}
