@@ -990,7 +990,7 @@ export default function DashboardPage() {
                             setAdminComment("");
                             // Trigger transcript reload
                             const res = await getAdminChatTranscript(selectedChatId);
-                            setTranscriptData(res);
+                            setTranscriptData(res.transcript);
                           } catch (err) {
                             alert("Failed to add comment.");
                           } finally {
@@ -1008,7 +1008,7 @@ export default function DashboardPage() {
                             await addConversationComment({ conversationId: selectedChatId, message: adminComment });
                             setAdminComment("");
                             const res = await getAdminChatTranscript(selectedChatId);
-                            setTranscriptData(res);
+                            setTranscriptData(res.transcript);
                           } catch (err) {
                             alert("Failed to add comment.");
                           } finally {
