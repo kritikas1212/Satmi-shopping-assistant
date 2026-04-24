@@ -182,6 +182,37 @@ class ToolingService:
             domain = domain.split("://", 1)[1]
         return domain.strip("/")
 
+    # Maps spiritual benefit/need keywords to product search terms to expand queries
+    _BENEFIT_KEYWORD_EXPANSION: dict[str, list[str]] = {
+        "anxiety": ["amethyst", "crystal", "rudraksha"],
+        "stress": ["amethyst", "crystal", "rudraksha"],
+        "calm": ["amethyst", "crystal"],
+        "peace": ["amethyst", "crystal", "rose quartz"],
+        "love": ["rose quartz"],
+        "compassion": ["rose quartz"],
+        "emotional": ["rose quartz", "crystal"],
+        "healing": ["rose quartz", "crystal", "rudraksha"],
+        "wealth": ["pyrite", "money", "prosperity"],
+        "money": ["pyrite", "money", "citrine"],
+        "prosperity": ["pyrite", "money", "citrine"],
+        "abundance": ["pyrite", "citrine"],
+        "financial": ["pyrite", "money"],
+        "protection": ["karungali", "rudraksha"],
+        "negativity": ["karungali", "rudraksha"],
+        "spiritual": ["rudraksha", "karungali"],
+        "growth": ["rudraksha"],
+        "energy": ["karungali", "crystal"],
+        "positive": ["karungali", "crystal"],
+        "meditation": ["rudraksha", "karungali"],
+        "chakra": ["crystal", "rudraksha"],
+        "health": ["rudraksha", "crystal"],
+        "confidence": ["pyrite", "tiger"],
+        "clarity": ["crystal", "amethyst"],
+        "luck": ["pyrite", "citrine", "karungali"],
+        "marriage": ["rose quartz"],
+        "relationship": ["rose quartz"],
+    }
+
     def _query_tokens(self, query: str) -> list[str]:
         stop_words = {
             "what",
@@ -200,27 +231,53 @@ class ToolingService:
             "do",
             "you",
             "have",
+            "give",
+            "get",
+            "want",
+            "need",
+            "some",
+            "my",
+            "with",
         }
         tokens = re.findall(r"[a-zA-Z0-9']+", query.lower())
         return [token for token in tokens if token not in stop_words and len(token) > 1]
 
+    def _expand_query_with_benefits(self, query: str, tokens: list[str]) -> list[str]:
+        """Expand query tokens with product-relevant keywords based on spiritual benefit intent."""
+        extra: list[str] = []
+        query_lower = query.lower()
+        for benefit_kw, expansions in self._BENEFIT_KEYWORD_EXPANSION.items():
+            if benefit_kw in query_lower:
+                extra.extend(expansions)
+        return tokens + extra
+
     def _extract_material_hints(self, query: str) -> set[str]:
+        # IMPORTANT: 'crystal' is intentionally excluded from hard-filter hints.
+        # It's too generic and causes zero results for wellness queries.
+        # It's still used in scoring via benefit keyword expansion.
         known_materials = {
             "rudraksha",
             "karungali",
-            "crystal",
             "pyrite",
-            "rose",
-            "quartz",
+            "rose quartz",
             "tulsi",
             "sandal",
             "silver",
+            "amethyst",
+            "citrine",
         }
+        query_lower = query.lower()
         tokens = set(self._query_tokens(query))
         hints: set[str] = set()
         if "rose" in tokens and "quartz" in tokens:
             hints.add("rose quartz")
-        hints.update(token for token in tokens if token in known_materials)
+        for material in known_materials:
+            if material in query_lower:
+                # Only add single-word materials directly
+                if " " not in material:
+                    hints.add(material)
+                else:
+                    hints.add(material)
         return hints
 
     def _matches_material_hints(self, product: dict[str, Any], hints: set[str]) -> bool:
@@ -249,17 +306,38 @@ class ToolingService:
         tags = str(product.get("tags", "")).lower()
 
         score = 0
-        for token in tokens:
+        query_l = query.lower().strip()
+
+        # ---- PHASE 1: Multi-word phrase match (highest priority) ----
+        # If the query has 2+ words and appears as an exact phrase in the title,
+        # give a massive bonus. This ensures "Seven Chakra" → "Pyrite x Seven Chakra Band"
+        if len(tokens) >= 2 and query_l in title:
+            score += 10  # Dominant match
+        elif len(tokens) >= 2 and query_l in searchable:
+            score += 5   # Found in description/tags but not title
+
+        # Check all consecutive 2-word pairs from query in title
+        for i in range(len(tokens) - 1):
+            bigram = f"{tokens[i]} {tokens[i+1]}"
+            if bigram in title:
+                score += 6
+
+        # ---- PHASE 2: Expand with benefit keywords for need-based queries ----
+        expanded_tokens = self._expand_query_with_benefits(query, tokens)
+
+        matched_any = False
+        for token in expanded_tokens:
             if token in title:
                 score += 3
+                matched_any = True
             elif token in product_type or token in tags:
                 score += 2
+                matched_any = True
             elif token in searchable:
                 score += 1
+                matched_any = True
 
-        query_l = query.lower().strip()
-        if query_l and query_l in title:
-            score += 4
+        # Bonus if ALL original (non-expanded) tokens match — strong relevance signal
         if tokens and all(token in searchable for token in tokens):
             score += 2
         return score
@@ -522,13 +600,25 @@ class ToolingService:
         clean_query = " ".join((query or "").split()).strip()
         query_tokens = self._query_tokens(clean_query)
         material_hints = self._extract_material_hints(clean_query)
-        generic_discovery = len(query_tokens) == 0 or clean_query.lower() in {
-            "product",
-            "products",
-            "satmi",
-            "best seller",
-            "best sellers",
+
+        # Detect best-seller / generic discovery intent
+        _BESTSELLER_PHRASES = {
+            "best seller", "best sellers", "bestseller", "bestsellers",
+            "best selling", "top product", "top products", "popular", "trending",
+            "most popular", "most sought", "most sold",
         }
+        clean_lower = clean_query.lower()
+        # Check if query contains any bestseller phrase as substring
+        is_bestseller = any(phrase in clean_lower for phrase in _BESTSELLER_PHRASES)
+        # Also detect multi-product name queries like "Karungali Rudraksha Rose Quartz"
+        _PRODUCT_NAMES = {"karungali", "rudraksha", "rose quartz", "pyrite", "amethyst", "crystal"}
+        named_product_count = sum(1 for name in _PRODUCT_NAMES if name in clean_lower)
+        generic_discovery = (
+            len(query_tokens) == 0
+            or clean_lower in {"product", "products", "satmi"}
+            or is_bestseller
+            or named_product_count >= 2  # multi-product query = best sellers style
+        )
 
         # --- Fetch products from best available source ---
         products: list[dict[str, Any]] = []
@@ -563,11 +653,15 @@ class ToolingService:
             }
 
         # --- Material hard-filter ---
+        # Only apply if material hints are present AND the filter yields results.
+        # If the filter would eliminate all products, fall back to unfiltered list.
         candidate_products = products
         if material_hints:
             filtered_by_material = [item for item in products if self._matches_material_hints(item, material_hints)]
-            candidate_products = filtered_by_material
-            source = f"{source}_material_filtered"
+            if filtered_by_material:
+                candidate_products = filtered_by_material
+                source = f"{source}_material_filtered"
+            # else: hints matched nothing — search full catalog instead
 
         # --- Rank & score ---
         ranked_results, matched_count = self._rank_products(query=clean_query or query, products=candidate_products, currency=currency)
@@ -576,8 +670,10 @@ class ToolingService:
         normalized_results: list[dict[str, Any]] = []
         storefront_domain = self._storefront_domain()
 
-        source_products = ranked_results if ranked_results else candidate_products[: settings.catalog_search_result_limit]
-
+        if generic_discovery:
+            source_products = ranked_results if ranked_results else candidate_products[: settings.catalog_search_result_limit]
+        else:
+            source_products = ranked_results
         for item in source_products[: settings.catalog_search_result_limit]:
             # Title
             title = str(item.get("title") or item.get("name") or "SATMI Product").strip() or "SATMI Product"

@@ -1,5 +1,6 @@
 __all__ = [
     "config",
+    "conversation_intent_classifier",
     "graph",
     "llm",
     "main",

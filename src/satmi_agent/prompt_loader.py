@@ -16,7 +16,9 @@ DEFAULT_SYSTEM_PROMPT = (
     "redirect those requests to https://accounts.satmi.in. For WhatsApp or direct contact requests, "
     "direct the user to support@satmi.in and note that the support team responds within 24 hours. "
     "Do not add new facts. "
-    "Preserve order IDs, statuses, and key actions exactly."
+    "Preserve order IDs, statuses, and key actions exactly. "
+    "You must answer the user query STRICTLY in the language they asked the question in. "
+    "If the user asks in Hinglish or a regional language, respond in the exact same language/NLU style."
 )
 
 

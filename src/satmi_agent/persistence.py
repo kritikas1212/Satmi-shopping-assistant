@@ -5,7 +5,7 @@ import hashlib
 import re
 from typing import Any, Literal
 
-from sqlalchemy import JSON, Boolean, Date, DateTime, Float, Integer, String, Text, create_engine, func, select
+from sqlalchemy import JSON, Boolean, Date, DateTime, Float, Integer, String, Text, create_engine, func, select, text, or_
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 from satmi_agent.config import settings
@@ -143,6 +143,55 @@ class QueryIntentDailyStatRecord(Base):
     )
 
 
+class ConversationIntentLabelRecord(Base):
+    __tablename__ = "conversation_intent_labels"
+
+    conversation_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    intent_label: Mapped[str] = mapped_column(String(64), default="unknown", index=True)
+    intent_subcategory: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    confidence: Mapped[float] = mapped_column(Float, default=0.0)
+    rationale_short: Mapped[str | None] = mapped_column(Text, nullable=True)
+    model_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    model_version: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    classified_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
+    source_version: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    needs_review: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    transcript_checksum: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+
+
+class ConversationIntentOverrideRecord(Base):
+    __tablename__ = "conversation_intent_overrides"
+
+    conversation_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    intent_label: Mapped[str] = mapped_column(String(64), default="unknown", index=True)
+    override_reason: Mapped[str] = mapped_column(Text)
+    overridden_by: Mapped[str] = mapped_column(String(128), default="admin")
+    overridden_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
+
+
+class ConversationIntentClassificationRunRecord(Base):
+    __tablename__ = "conversation_intent_classification_runs"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    conversation_id: Mapped[str] = mapped_column(String(128), index=True)
+    intent_label: Mapped[str] = mapped_column(String(64), default="unknown", index=True)
+    raw_intent_label: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    classifier_mode: Mapped[str] = mapped_column(String(32), default="guardrailed", index=True)
+    confidence: Mapped[float] = mapped_column(Float, default=0.0)
+    rationale_short: Mapped[str | None] = mapped_column(Text, nullable=True)
+    model_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    model_version: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    source_version: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    raw_output: Mapped[str | None] = mapped_column(Text, nullable=True)
+    raw_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    prompt_token_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    completion_token_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    total_token_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    prompt_char_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    transcript_checksum: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
+
+
 def _normalize_database_url(url: str) -> str:
     normalized = (url or "").strip()
     if normalized.startswith("postgres://"):
@@ -152,7 +201,12 @@ def _normalize_database_url(url: str) -> str:
     return normalized
 
 
-engine = create_engine(_normalize_database_url(settings.database_url), future=True)
+_db_url = _normalize_database_url(settings.database_url)
+_engine_kwargs = {"future": True}
+if _db_url.startswith("postgresql"):
+    _engine_kwargs["pool_pre_ping"] = True
+    _engine_kwargs["pool_recycle"] = 300
+engine = create_engine(_db_url, **_engine_kwargs)
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False, autoflush=False, future=True)
 
 
@@ -242,16 +296,16 @@ def _normalize_intent(intent: str | None) -> str:
     return "unknown"
 
 
+def _normalize_conversation_intent_label(intent: str | None) -> str:
+    return str(intent or "unknown").strip()
+
+
+def _conversation_intent_to_label(intent: str | None) -> str:
+    return str(intent or "unknown").strip() or "unknown"
+
+
 def _intent_to_label(intent: str | None) -> str:
-    mapping = {
-        "shopping": "Product Discovery",
-        "order_tracking": "Order Tracking",
-        "policy_brand_faq": "Policy & FAQ",
-        "authentication": "Account & Login",
-        "general": "General Inquiry",
-        "unknown": "General Inquiry",
-    }
-    return mapping[_normalize_intent(intent)]
+    return str(intent or "unknown").strip() or "unknown"
 
 
 def _is_frustrated_session(user_messages: list[str]) -> bool:
@@ -280,6 +334,13 @@ def _is_resolved_session(events: list[ConversationEventRecord]) -> bool:
 class PersistenceService:
     def init_db(self) -> None:
         Base.metadata.create_all(bind=engine)
+        # Safe migration: add intent_subcategory column if it doesn't exist (for existing databases)
+        try:
+            with engine.connect() as conn:
+                conn.execute(text("ALTER TABLE conversation_intent_labels ADD COLUMN intent_subcategory VARCHAR(128)"))
+                conn.commit()
+        except Exception:
+            pass  # Column already exists
 
     def _session(self) -> Session:
         return SessionLocal()
@@ -388,6 +449,365 @@ class PersistenceService:
             )
             rows = list(session.scalars(stmt).all())
             return [str(row.message or "").strip() for row in rows if str(row.message or "").strip()]
+
+    def list_conversation_events_for_classification(self, conversation_id: str, limit: int | None = None) -> list[ConversationEventRecord]:
+        max_limit = max(int(limit or settings.conversation_intent_transcript_event_limit), 1)
+        with self._session() as session:
+            stmt = (
+                select(ConversationEventRecord)
+                .where(ConversationEventRecord.conversation_id == conversation_id)
+                .where(ConversationEventRecord.role.in_(["user", "assistant", "system"]))
+                .order_by(ConversationEventRecord.created_at.asc())
+                .limit(max_limit)
+            )
+            return list(session.scalars(stmt).all())
+
+    def compute_transcript_checksum(self, conversation_id: str, *, limit: int | None = None) -> str:
+        events = self.list_conversation_events_for_classification(conversation_id, limit=limit)
+        digest = hashlib.sha256()
+        for event in events:
+            digest.update(f"{event.created_at.isoformat()}|{event.role}|{event.message}\n".encode("utf-8"))
+        return digest.hexdigest()
+
+    def upsert_conversation_intent_label(
+        self,
+        *,
+        conversation_id: str,
+        intent_label: str,
+        confidence: float,
+        rationale_short: str | None,
+        model_name: str | None,
+        model_version: str | None,
+        source_version: str | None,
+        needs_review: bool,
+        transcript_checksum: str | None,
+        classified_at: datetime | None = None,
+        intent_subcategory: str | None = None,
+    ) -> None:
+        exact_intent = str(intent_label or "unknown").strip() or "unknown"
+        now = classified_at or datetime.now(timezone.utc)
+        with self._session() as session:
+            row = session.get(ConversationIntentLabelRecord, conversation_id)
+            if row is None:
+                row = ConversationIntentLabelRecord(
+                    conversation_id=conversation_id,
+                    intent_label=exact_intent,
+                    intent_subcategory=str(intent_subcategory or "")[:128] or None,
+                    confidence=max(0.0, min(float(confidence), 1.0)),
+                    rationale_short=scrub_pii(rationale_short or ""),
+                    model_name=model_name,
+                    model_version=model_version,
+                    classified_at=now,
+                    source_version=source_version,
+                    needs_review=bool(needs_review),
+                    transcript_checksum=transcript_checksum,
+                )
+                session.add(row)
+            else:
+                row.intent_label = exact_intent
+                row.intent_subcategory = str(intent_subcategory or "")[:128] or None
+                row.confidence = max(0.0, min(float(confidence), 1.0))
+                row.rationale_short = scrub_pii(rationale_short or "")
+                row.model_name = model_name
+                row.model_version = model_version
+                row.classified_at = now
+                row.source_version = source_version
+                row.needs_review = bool(needs_review)
+                row.transcript_checksum = transcript_checksum
+            session.commit()
+
+    def create_conversation_intent_classification_run(
+        self,
+        *,
+        conversation_id: str,
+        intent_label: str,
+        raw_intent_label: str | None,
+        classifier_mode: str,
+        confidence: float,
+        rationale_short: str | None,
+        model_name: str | None,
+        model_version: str | None,
+        source_version: str | None,
+        raw_output: str | None,
+        raw_error: str | None,
+        prompt_token_count: int | None,
+        completion_token_count: int | None,
+        total_token_count: int | None,
+        prompt_char_count: int | None,
+        transcript_checksum: str | None,
+        created_at: datetime | None = None,
+    ) -> None:
+        exact_intent = str(intent_label or "unknown").strip() or "unknown"
+        exact_raw_intent = str(raw_intent_label or exact_intent).strip() or exact_intent
+        now = created_at or datetime.now(timezone.utc)
+        with self._session() as session:
+            session.add(
+                ConversationIntentClassificationRunRecord(
+                    conversation_id=conversation_id,
+                    intent_label=exact_intent,
+                    raw_intent_label=exact_raw_intent[:256] or None,
+                    classifier_mode=str(classifier_mode or "guardrailed")[:32],
+                    confidence=max(0.0, min(float(confidence), 1.0)),
+                    rationale_short=scrub_pii(rationale_short or ""),
+                    model_name=model_name,
+                    model_version=model_version,
+                    source_version=source_version,
+                    raw_output=scrub_pii(str(raw_output or "")[:12000]),
+                    raw_error=scrub_pii(str(raw_error or "")[:2000]),
+                    prompt_token_count=prompt_token_count,
+                    completion_token_count=completion_token_count,
+                    total_token_count=total_token_count,
+                    prompt_char_count=prompt_char_count,
+                    transcript_checksum=transcript_checksum,
+                    created_at=now,
+                )
+            )
+            session.commit()
+
+    def get_conversation_intent_label(self, conversation_id: str) -> dict[str, Any] | None:
+        with self._session() as session:
+            label_row = session.get(ConversationIntentLabelRecord, conversation_id)
+            override_row = session.get(ConversationIntentOverrideRecord, conversation_id)
+            latest_run = session.scalars(
+                select(ConversationIntentClassificationRunRecord)
+                .where(ConversationIntentClassificationRunRecord.conversation_id == conversation_id)
+                .order_by(
+                    ConversationIntentClassificationRunRecord.created_at.desc(),
+                    ConversationIntentClassificationRunRecord.id.desc(),
+                )
+                .limit(1)
+            ).first()
+            if label_row is None and override_row is None:
+                return None
+
+            label_value = override_row.intent_label if override_row is not None else (label_row.intent_label if label_row is not None else "unknown")
+            return {
+                "conversation_id": conversation_id,
+                "intent_label": str(label_value or "unknown").strip() or "unknown",
+                "intent_display": str(label_value or "unknown").strip() or "unknown",
+                "confidence": float(label_row.confidence) if label_row is not None else None,
+                "rationale_short": str(label_row.rationale_short or "") if label_row is not None else "",
+                "model_name": str(label_row.model_name or "") if label_row is not None else "",
+                "model_version": str(label_row.model_version or "") if label_row is not None else "",
+                "classified_at": label_row.classified_at.isoformat() if label_row is not None else None,
+                "source_version": str(label_row.source_version or "") if label_row is not None else "",
+                "needs_review": bool(label_row.needs_review) if label_row is not None else True,
+                "transcript_checksum": str(label_row.transcript_checksum or "") if label_row is not None else "",
+                "is_overridden": override_row is not None,
+                "override_reason": str(override_row.override_reason or "") if override_row is not None else None,
+                "overridden_by": str(override_row.overridden_by or "") if override_row is not None else None,
+                "overridden_at": override_row.overridden_at.isoformat() if override_row is not None else None,
+                "raw_intent_label": str(latest_run.raw_intent_label or "") if latest_run is not None else "",
+                "classifier_mode": str(latest_run.classifier_mode or "") if latest_run is not None else "",
+                "classifier_raw_error": str(latest_run.raw_error or "") if latest_run is not None else "",
+                "classifier_raw_output": str(latest_run.raw_output or "") if latest_run is not None else "",
+                "classifier_prompt_token_count": int(latest_run.prompt_token_count)
+                if latest_run is not None and latest_run.prompt_token_count is not None
+                else None,
+                "classifier_completion_token_count": int(latest_run.completion_token_count)
+                if latest_run is not None and latest_run.completion_token_count is not None
+                else None,
+                "classifier_total_token_count": int(latest_run.total_token_count)
+                if latest_run is not None and latest_run.total_token_count is not None
+                else None,
+                "classifier_prompt_char_count": int(latest_run.prompt_char_count)
+                if latest_run is not None and latest_run.prompt_char_count is not None
+                else None,
+            }
+
+    def get_cached_intent_by_checksum(self, checksum: str) -> dict[str, Any] | None:
+        """Find an existing classification with the same exact transcript checksum and high confidence."""
+        if not checksum:
+            return None
+            
+        with self._session() as session:
+            # Look for any row with this exact checksum and confidence >= 0.95
+            stmt = (
+                select(ConversationIntentLabelRecord)
+                .where(ConversationIntentLabelRecord.transcript_checksum == checksum)
+                .where(ConversationIntentLabelRecord.confidence >= 0.95)
+                .where(ConversationIntentLabelRecord.intent_label != "unknown")
+                .order_by(ConversationIntentLabelRecord.classified_at.desc())
+                .limit(1)
+            )
+            row = session.scalars(stmt).first()
+            if not row:
+                return None
+                
+            return {
+                "intent_label": row.intent_label,
+                "confidence": float(row.confidence),
+                "rationale_short": str(row.rationale_short or ""),
+                "model_name": str(row.model_name or ""),
+                "model_version": str(row.model_version or ""),
+                "source_version": str(row.source_version or ""),
+                "needs_review": bool(row.needs_review),
+                "transcript_checksum": str(row.transcript_checksum or ""),
+                "classified_at": row.classified_at.isoformat(),
+            }
+
+    def list_conversation_intent_labels(self, conversation_ids: list[str]) -> dict[str, dict[str, Any]]:
+        ids = [str(item) for item in conversation_ids if str(item).strip()]
+        if not ids:
+            return {}
+
+        with self._session() as session:
+            label_rows = list(
+                session.scalars(
+                    select(ConversationIntentLabelRecord).where(ConversationIntentLabelRecord.conversation_id.in_(ids))
+                ).all()
+            )
+            override_rows = list(
+                session.scalars(
+                    select(ConversationIntentOverrideRecord).where(ConversationIntentOverrideRecord.conversation_id.in_(ids))
+                ).all()
+            )
+            ranked_runs_subquery = (
+                select(
+                    ConversationIntentClassificationRunRecord.id.label("run_id"),
+                    func.row_number()
+                    .over(
+                        partition_by=ConversationIntentClassificationRunRecord.conversation_id,
+                        order_by=(
+                            ConversationIntentClassificationRunRecord.created_at.desc(),
+                            ConversationIntentClassificationRunRecord.id.desc(),
+                        ),
+                    )
+                    .label("row_num"),
+                )
+                .where(ConversationIntentClassificationRunRecord.conversation_id.in_(ids))
+                .subquery()
+            )
+            latest_runs = list(
+                session.scalars(
+                    select(ConversationIntentClassificationRunRecord)
+                    .join(
+                        ranked_runs_subquery,
+                        ConversationIntentClassificationRunRecord.id == ranked_runs_subquery.c.run_id,
+                    )
+                    .where(ranked_runs_subquery.c.row_num == 1)
+                ).all()
+            )
+
+        label_map = {row.conversation_id: row for row in label_rows}
+        override_map = {row.conversation_id: row for row in override_rows}
+        latest_run_map = {row.conversation_id: row for row in latest_runs}
+        result: dict[str, dict[str, Any]] = {}
+
+        for conversation_id in ids:
+            label_row = label_map.get(conversation_id)
+            override_row = override_map.get(conversation_id)
+            run_row = latest_run_map.get(conversation_id)
+            if label_row is None and override_row is None:
+                continue
+
+            effective_label = override_row.intent_label if override_row is not None else (label_row.intent_label if label_row is not None else "unknown")
+            result[conversation_id] = {
+                "intent_label": str(effective_label or "unknown").strip() or "unknown",
+                "intent_display": str(effective_label or "unknown").strip() or "unknown",
+                "intent_subcategory": str(getattr(label_row, "intent_subcategory", "")) if label_row is not None else "",
+                "confidence": float(label_row.confidence) if label_row is not None else None,
+                "model_name": str(label_row.model_name or "") if label_row is not None else "",
+                "model_version": str(label_row.model_version or "") if label_row is not None else "",
+                "classified_at": label_row.classified_at.isoformat() if label_row is not None else None,
+                "source_version": str(label_row.source_version or "") if label_row is not None else "",
+                "needs_review": bool(label_row.needs_review) if label_row is not None else True,
+                "transcript_checksum": str(label_row.transcript_checksum or "") if label_row is not None else "",
+                "rationale_short": str(label_row.rationale_short or "") if label_row is not None else "",
+                "is_overridden": override_row is not None,
+                "override_reason": str(override_row.override_reason or "") if override_row is not None else None,
+                "overridden_by": str(override_row.overridden_by or "") if override_row is not None else None,
+                "overridden_at": override_row.overridden_at.isoformat() if override_row is not None else None,
+                "raw_intent_label": str(run_row.raw_intent_label or "") if run_row is not None else "",
+                "classifier_mode": str(run_row.classifier_mode or "") if run_row is not None else "",
+                "classifier_raw_error": str(run_row.raw_error or "") if run_row is not None else "",
+                "classifier_total_token_count": int(run_row.total_token_count)
+                if run_row is not None and run_row.total_token_count is not None
+                else None,
+            }
+
+        return result
+
+    def upsert_conversation_intent_override(
+        self,
+        *,
+        conversation_id: str,
+        intent_label: str,
+        override_reason: str,
+        overridden_by: str,
+    ) -> None:
+        exact_intent = str(intent_label or "unknown").strip() or "unknown"
+        now = datetime.now(timezone.utc)
+        with self._session() as session:
+            row = session.get(ConversationIntentOverrideRecord, conversation_id)
+            if row is None:
+                row = ConversationIntentOverrideRecord(
+                    conversation_id=conversation_id,
+                    intent_label=exact_intent,
+                    override_reason=scrub_pii(override_reason),
+                    overridden_by=str(overridden_by or "admin"),
+                    overridden_at=now,
+                )
+                session.add(row)
+            else:
+                row.intent_label = exact_intent
+                row.override_reason = scrub_pii(override_reason)
+                row.overridden_by = str(overridden_by or "admin")
+                row.overridden_at = now
+            session.commit()
+
+    def clear_conversation_intent_override(self, conversation_id: str) -> None:
+        with self._session() as session:
+            row = session.get(ConversationIntentOverrideRecord, conversation_id)
+            if row is None:
+                return
+            session.delete(row)
+            session.commit()
+
+    def list_inactive_conversations_needing_intent_classification(self, *, inactive_minutes: int, limit: int) -> list[dict[str, Any]]:
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=max(inactive_minutes, 1))
+        max_limit = max(limit, 1)
+        candidates: list[dict[str, Any]] = []
+
+        with self._session() as session:
+            subquery = (
+                select(
+                    ConversationEventRecord.conversation_id.label("conversation_id"),
+                    func.max(ConversationEventRecord.created_at).label("last_activity_at"),
+                )
+                .where(ConversationEventRecord.role.in_(["user", "assistant", "system"]))
+                .group_by(ConversationEventRecord.conversation_id)
+                .having(func.max(ConversationEventRecord.created_at) <= cutoff)
+                .order_by(func.max(ConversationEventRecord.created_at).desc())
+                .limit(max_limit)
+            )
+            rows = session.execute(subquery).all()
+
+            for item in rows:
+                conversation_id = str(item.conversation_id)
+                events = self.list_conversation_events_for_classification(conversation_id)
+                if not events:
+                    continue
+
+                checksum = hashlib.sha256(
+                    "".join(f"{event.created_at.isoformat()}|{event.role}|{event.message}\n" for event in events).encode("utf-8")
+                ).hexdigest()
+                label_row = session.get(ConversationIntentLabelRecord, conversation_id)
+
+                if label_row is not None and str(label_row.transcript_checksum or "") == checksum:
+                    continue
+
+                user_id = next((str(event.user_id or "") for event in events if str(event.user_id or "").strip()), "unknown")
+                candidates.append(
+                    {
+                        "conversation_id": conversation_id,
+                        "user_id": user_id,
+                        "last_activity_at": item.last_activity_at.isoformat() if item.last_activity_at is not None else None,
+                        "transcript_checksum": checksum,
+                    }
+                )
+
+        return candidates
 
     def create_async_task(
         self,
@@ -826,46 +1246,134 @@ class PersistenceService:
         paged = normalized[offset : offset + max(limit, 1)]
         return paged
 
-    def list_dashboard_chat_sessions(self, *, limit: int = 150, offset: int = 0) -> dict[str, Any]:
-        target_limit = max(min(limit, 150), 1)
-        target_offset = max(offset, 0)
+    def list_dashboard_chat_sessions(
+        self,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+        start_date: datetime | None = None,
+        end_date: datetime | None = None,
+    ) -> dict[str, Any]:
+        from pathlib import Path
+        import json
+        target_limit = min(max(int(limit), 1), 500)
+        target_offset = max(int(offset), 0)
         session_event_limit = DASHBOARD_SESSION_EVENT_LIMIT
         category_labels = ["Order Tracking", "Product Search", "Returns", "Policy & FAQ", "General"]
-        intent_labels = ["Product Discovery", "Order Tracking", "Policy & FAQ", "Account & Login", "General Inquiry"]
+        cat_path = Path("data/categories.json")
+        if cat_path.exists():
+            try:
+                category_labels = json.loads(cat_path.read_text("utf-8"))
+            except Exception:
+                pass
+        apply_llm_primary = (
+            settings.conversation_intent_classifier_enabled
+            and not settings.conversation_intent_shadow_mode
+        )
 
         with self._session() as session:
             # Get total number of sessions
-            total_sessions = session.scalar(
+            total_sessions_q = select(func.count(func.distinct(ConversationEventRecord.conversation_id)))
+            if start_date:
+                total_sessions_q = total_sessions_q.where(ConversationEventRecord.created_at >= start_date)
+            if end_date:
+                total_sessions_q = total_sessions_q.where(ConversationEventRecord.created_at <= end_date)
+            total_sessions = session.scalar(total_sessions_q) or 0
+
+            # Get recommendation conversions
+            rec_conv_q = (
                 select(func.count(func.distinct(ConversationEventRecord.conversation_id)))
-            ) or 0
+                .where(
+                    or_(
+                        ConversationEventRecord.action == "portal_redirect",
+                        ConversationEventRecord.message.ilike("%select & buy%"),
+                        ConversationEventRecord.message.ilike("%select and buy%")
+                    )
+                )
+            )
+            if start_date:
+                rec_conv_q = rec_conv_q.where(ConversationEventRecord.created_at >= start_date)
+            if end_date:
+                rec_conv_q = rec_conv_q.where(ConversationEventRecord.created_at <= end_date)
+            
+            recommendation_conversions = session.scalar(rec_conv_q) or 0
 
             # Get overall intent breakdowns
-            global_intents = session.execute(
-                select(ConversationEventRecord.intent, func.count())
-                .where(ConversationEventRecord.role == "assistant")
-                .where(ConversationEventRecord.intent.is_not(None))
-                .group_by(ConversationEventRecord.intent)
-            ).all()
-
-            global_intent_counts = {label: 0 for label in intent_labels}
+            global_intent_counts: dict[str, int] = {}
             global_intent_total = 0
-            for db_intent, count in global_intents:
-                label = _intent_to_label(db_intent)
-                global_intent_counts[label] += count
-                global_intent_total += count
+            global_subcategory_counts: dict[tuple[str, str], int] = {}
+
+            if apply_llm_primary:
+                label_q = select(ConversationIntentLabelRecord, ConversationIntentOverrideRecord).outerjoin(
+                    ConversationIntentOverrideRecord,
+                    ConversationIntentOverrideRecord.conversation_id == ConversationIntentLabelRecord.conversation_id,
+                )
+                if start_date:
+                    label_q = label_q.where(ConversationIntentLabelRecord.classified_at >= start_date)
+                if end_date:
+                    label_q = label_q.where(ConversationIntentLabelRecord.classified_at <= end_date)
+                    
+                label_rows = session.execute(label_q).all()
+                for label_row, override_row in label_rows:
+                    raw_intent = override_row.intent_label if override_row is not None else label_row.intent_label
+                    display_label = str(raw_intent or "unknown").strip() or "unknown"
+                    if display_label not in global_intent_counts:
+                        global_intent_counts[display_label] = 0
+                    global_intent_counts[display_label] += 1
+                    global_intent_total += 1
+                    # Track subcategories
+                    subcategory = getattr(label_row, "intent_subcategory", None)
+                    if subcategory:
+                        subcat_display = subcategory.replace("_", " ").title()
+                        sub_key = (display_label, subcat_display)
+                        global_subcategory_counts[sub_key] = global_subcategory_counts.get(sub_key, 0) + 1
+            else:
+                global_intents_q = select(ConversationEventRecord.intent, func.count()).where(ConversationEventRecord.role == "assistant").where(ConversationEventRecord.intent.is_not(None))
+                if start_date:
+                    global_intents_q = global_intents_q.where(ConversationEventRecord.created_at >= start_date)
+                if end_date:
+                    global_intents_q = global_intents_q.where(ConversationEventRecord.created_at <= end_date)
+                global_intents_q = global_intents_q.group_by(ConversationEventRecord.intent)
+                
+                global_intents = session.execute(global_intents_q).all()
+                for db_intent, count in global_intents:
+                    label = str(db_intent or "unknown").strip() or "unknown"
+                    global_intent_counts[label] = global_intent_counts.get(label, 0) + count
+                    global_intent_total += count
 
             # Add defaults if nothing exists
             if global_intent_total == 0:
-                global_intent_counts["General Inquiry"] += 1
+                global_intent_counts["unknown"] = global_intent_counts.get("unknown", 0) + 1
                 global_intent_total += 1
 
+            # --- Daily Activity ---
+            daily_activity_q = select(
+                func.date(ConversationEventRecord.created_at).label("date"),
+                func.count(func.distinct(ConversationEventRecord.conversation_id)).label("sessions")
+            ).group_by(func.date(ConversationEventRecord.created_at))
+            
+            if start_date:
+                daily_activity_q = daily_activity_q.where(ConversationEventRecord.created_at >= start_date)
+            if end_date:
+                daily_activity_q = daily_activity_q.where(ConversationEventRecord.created_at <= end_date)
+            daily_activity_q = daily_activity_q.order_by(func.date(ConversationEventRecord.created_at).asc())
+
+            daily_activity_rows = session.execute(daily_activity_q).all()
+            daily_activity_list = [{"date": str(row.date), "sessions": row.sessions} for row in daily_activity_rows]
+
+
+            recent_sessions_q = select(
+                ConversationEventRecord.conversation_id.label("conversation_id"),
+                func.max(ConversationEventRecord.created_at).label("last_activity_at"),
+            ).group_by(ConversationEventRecord.conversation_id)
+            
+            if start_date:
+                recent_sessions_q = recent_sessions_q.having(func.max(ConversationEventRecord.created_at) >= start_date)
+            if end_date:
+                recent_sessions_q = recent_sessions_q.having(func.max(ConversationEventRecord.created_at) <= end_date)
+                
             recent_sessions_subquery = (
-                select(
-                    ConversationEventRecord.conversation_id.label("conversation_id"),
-                    func.max(ConversationEventRecord.created_at).label("last_activity_at"),
-                )
-                .group_by(ConversationEventRecord.conversation_id)
-                .order_by(func.max(ConversationEventRecord.created_at).desc())
+                recent_sessions_q.order_by(func.max(ConversationEventRecord.created_at).desc())
                 .limit(target_limit)
                 .offset(target_offset)
                 .subquery()
@@ -892,11 +1400,7 @@ class PersistenceService:
                         {"category": "General", "count": 0, "percentage": 0.0},
                     ],
                     "intent_breakdown": [
-                        {"intent": "Product Discovery", "count": 0, "percentage": 0.0},
-                        {"intent": "Order Tracking", "count": 0, "percentage": 0.0},
-                        {"intent": "Policy & FAQ", "count": 0, "percentage": 0.0},
-                        {"intent": "Account & Login", "count": 0, "percentage": 0.0},
-                        {"intent": "General Inquiry", "count": 0, "percentage": 0.0},
+                        {"intent": "unknown", "count": 0, "percentage": 0.0},
                     ],
                     "top_trending_terms": [],
                 }
@@ -930,20 +1434,15 @@ class PersistenceService:
         for row in rows:
             by_conversation.setdefault(row.conversation_id, []).append(row)
 
+        label_map = self.list_conversation_intent_labels(conversation_ids)
+
         last_activity_lookup = {
             str(row.conversation_id): row.last_activity_at for row in session_rows if row.last_activity_at is not None
         }
 
         sessions: list[dict[str, Any]] = []
         resolved_count = 0
-        category_totals = {
-            "Order Tracking": 0,
-            "Product Search": 0,
-            "Returns": 0,
-            "Policy & FAQ": 0,
-            "General": 0,
-        }
-        intent_totals = {label: 0 for label in intent_labels}
+        category_totals: dict[str, int] = {}
         trend_counts: dict[str, int] = {}
 
         for conversation_id in conversation_ids:
@@ -955,19 +1454,8 @@ class PersistenceService:
             user_id = next((str(event.user_id or "") for event in events if event.user_id), "unknown")
             user_id_hash = hashlib.sha256(user_id.encode("utf-8")).hexdigest()[:32]
 
-            category_counts = {
-                "Order Tracking": 0,
-                "Product Search": 0,
-                "Returns": 0,
-                "Policy & FAQ": 0,
-                "General": 0,
-            }
-            session_intent_counts = {label: 0 for label in intent_labels}
+            session_intent_counts: dict[str, int] = {}
             for message in user_messages:
-                category = _classify_message_category(message)
-                category_counts[category] += 1
-                category_totals[category] += 1
-
                 trend_term = _extract_trend_term(message)
                 if trend_term:
                     trend_counts[trend_term] = trend_counts.get(trend_term, 0) + 1
@@ -975,28 +1463,45 @@ class PersistenceService:
             for event in events:
                 if event.role != "assistant":
                     continue
-                label = _intent_to_label(event.intent)
-                session_intent_counts[label] += 1
-                intent_totals[label] += 1
+                label = str(event.intent or "unknown").strip() or "unknown"
+                session_intent_counts[label] = session_intent_counts.get(label, 0) + 1
 
-            dominant_category = max(category_counts.items(), key=lambda item: item[1])[0]
-            if all(count == 0 for count in category_counts.values()):
+            label_meta = label_map.get(conversation_id)
+            if label_meta is not None:
+                cat = label_meta.get("intent_subcategory", "General")
+                dominant_category = cat if cat else "General"
+                
+                # Robust normalization against predefined dynamic categories
+                matched = False
+                for cl in category_labels:
+                    if cl.lower().strip() == dominant_category.lower().strip():
+                        dominant_category = cl
+                        matched = True
+                        break
+                if not matched:
+                    for cl in category_labels:
+                        if cl.lower().strip() in dominant_category.lower().strip() or dominant_category.lower().strip() in cl.lower().strip():
+                            dominant_category = cl
+                            matched = True
+                            break
+                if not matched:
+                    dominant_category = category_labels[-1] if category_labels else "General"
+            else:
                 dominant_category = "General"
+            
+            category_totals[dominant_category] = category_totals.get(dominant_category, 0) + 1
 
             if sum(session_intent_counts.values()) == 0:
-                inferred_label = _intent_to_label(
-                    "policy_brand_faq"
-                    if dominant_category == "Policy & FAQ"
-                    else "shopping"
-                    if dominant_category == "Product Search"
-                    else "order_tracking"
-                    if dominant_category == "Order Tracking"
-                    else "general"
-                )
+                inferred_label = "unknown"
                 session_intent_counts[inferred_label] += 1
-                intent_totals[inferred_label] += 1
 
-            dominant_intent = max(session_intent_counts.items(), key=lambda item: item[1])[0]
+            label_meta = label_map.get(conversation_id)
+            if label_meta is not None and bool(label_meta.get("is_overridden")):
+                dominant_intent = str(label_meta.get("intent_display") or "unknown")
+            elif apply_llm_primary and label_meta is not None:
+                dominant_intent = str(label_meta.get("intent_display") or "unknown")
+            else:
+                dominant_intent = max(session_intent_counts.items(), key=lambda item: item[1])[0]
 
             is_frustrated = _is_frustrated_session(user_messages)
             is_resolved = _is_resolved_session(events)
@@ -1016,6 +1521,23 @@ class PersistenceService:
                     "status": session_status,
                     "dominant_category": dominant_category,
                     "dominant_intent": dominant_intent,
+                    "intent_confidence": (
+                        None
+                        if label_meta is None
+                        or bool(label_meta.get("is_overridden"))
+                        or label_meta.get("confidence") is None
+                        else float(label_meta.get("confidence"))
+                    ),
+                    "intent_model_version": str(label_meta.get("model_version") or "") if label_meta is not None else None,
+                    "intent_model_name": str(label_meta.get("model_name") or "") if label_meta is not None else None,
+                    "intent_source_version": str(label_meta.get("source_version") or "") if label_meta is not None else None,
+                    "intent_needs_review": bool(label_meta.get("needs_review")) if label_meta is not None else None,
+                    "intent_is_overridden": bool(label_meta.get("is_overridden")) if label_meta is not None else False,
+                    "intent_override_reason": str(label_meta.get("override_reason") or "") if label_meta is not None else None,
+                    "intent_raw_label": str(label_meta.get("raw_intent_label") or "") if label_meta is not None else None,
+                    "intent_classifier_mode": str(label_meta.get("classifier_mode") or "") if label_meta is not None else None,
+                    "intent_classifier_error": str(label_meta.get("classifier_raw_error") or "") if label_meta is not None else None,
+                    "intent_classifier_total_tokens": label_meta.get("classifier_total_token_count") if label_meta is not None else None,
                     "started_at": started_at,
                     "last_activity_at": last_activity_at,
                 }
@@ -1028,7 +1550,7 @@ class PersistenceService:
 
         category_divide = []
         for category in category_labels:
-            count = category_totals[category]
+            count = category_totals.get(category, 0)
             percentage = 0.0
             if total_categorized_messages > 0:
                 percentage = round((count / total_categorized_messages) * 100.0, 2)
@@ -1040,9 +1562,13 @@ class PersistenceService:
                 }
             )
 
+        # Build dynamic top-20 intent breakdown sorted by count
+        all_intents_sorted = sorted(global_intent_counts.items(), key=lambda item: item[1], reverse=True)
+        # Take top 20 intents
+        top_intents = all_intents_sorted[:20]
+
         intent_breakdown = []
-        for intent in intent_labels:
-            count = global_intent_counts[intent]
+        for intent, count in top_intents:
             percentage = 0.0
             if global_intent_total > 0:
                 percentage = round((count / global_intent_total) * 100.0, 2)
@@ -1051,6 +1577,19 @@ class PersistenceService:
                     "intent": intent,
                     "count": count,
                     "percentage": percentage,
+                }
+            )
+
+        # Build subcategory breakdown
+        intent_subcategory_breakdown = []
+        for (parent_intent, subcategory), sub_count in sorted(
+            global_subcategory_counts.items(), key=lambda x: x[1], reverse=True
+        ):
+            intent_subcategory_breakdown.append(
+                {
+                    "parent_intent": parent_intent,
+                    "subcategory": subcategory,
+                    "count": sub_count,
                 }
             )
 
@@ -1067,9 +1606,48 @@ class PersistenceService:
             "total_sessions": total_sessions,
             "sessions": sessions,
             "resolution_rate": resolution_rate,
+            "recommendation_conversions": recommendation_conversions,
             "category_divide": category_divide,
             "intent_breakdown": intent_breakdown,
+            "intent_subcategory_breakdown": intent_subcategory_breakdown,
             "top_trending_terms": top_trending_terms,
+            "daily_activity": daily_activity_list,
+        }
+
+    def delete_conversation(self, conversation_id: str) -> dict[str, int]:
+        with self._session() as session:
+            deleted_events = session.query(ConversationEventRecord).filter(
+                ConversationEventRecord.conversation_id == conversation_id
+            ).delete(synchronize_session=False)
+            deleted_tasks = session.query(AsyncTaskRecord).filter(
+                AsyncTaskRecord.conversation_id == conversation_id
+            ).delete(synchronize_session=False)
+            deleted_handoffs = session.query(HandoffTicketRecord).filter(
+                HandoffTicketRecord.conversation_id == conversation_id
+            ).delete(synchronize_session=False)
+            deleted_query_events = session.query(ChatQueryEventRecord).filter(
+                ChatQueryEventRecord.conversation_id == conversation_id
+            ).delete(synchronize_session=False)
+            deleted_labels = session.query(ConversationIntentLabelRecord).filter(
+                ConversationIntentLabelRecord.conversation_id == conversation_id
+            ).delete(synchronize_session=False)
+            deleted_overrides = session.query(ConversationIntentOverrideRecord).filter(
+                ConversationIntentOverrideRecord.conversation_id == conversation_id
+            ).delete(synchronize_session=False)
+            deleted_runs = session.query(ConversationIntentClassificationRunRecord).filter(
+                ConversationIntentClassificationRunRecord.conversation_id == conversation_id
+            ).delete(synchronize_session=False)
+
+            session.commit()
+
+        return {
+            "conversation_events": int(deleted_events or 0),
+            "async_tasks": int(deleted_tasks or 0),
+            "handoff_tickets": int(deleted_handoffs or 0),
+            "chat_query_events": int(deleted_query_events or 0),
+            "intent_labels": int(deleted_labels or 0),
+            "intent_overrides": int(deleted_overrides or 0),
+            "intent_runs": int(deleted_runs or 0),
         }
 
 
@@ -1090,7 +1668,8 @@ class PersistenceService:
                 "role": event.role,
                 "message": event.message,
                 "created_at": event.created_at.isoformat(),
-                "intent": _intent_to_label(event.intent) if event.intent else None,
+                "intent": str(event.intent or "unknown").strip() or "unknown",
+                "event_metadata": dict(event.event_metadata or {}),
             }
             for event in rows
         ]
@@ -1143,8 +1722,12 @@ class PersistenceService:
                     "session_status": session_info["status"],
                     "dominant_category": session_info["dominant_category"],
                     "dominant_intent": session_info["dominant_intent"],
+                    "intent_confidence": session_info.get("intent_confidence"),
+                    "intent_model_version": session_info.get("intent_model_version"),
+                    "intent_raw_label": session_info.get("intent_raw_label"),
+                    "intent_classifier_mode": session_info.get("intent_classifier_mode"),
                     "role": event.role,
-                    "intent": _intent_to_label(event.intent) if event.intent else None,
+                    "intent": str(event.intent or "unknown").strip() or "unknown",
                     "message": scrub_pii(event.message),
                     "created_at": event.created_at.isoformat(),
                 }

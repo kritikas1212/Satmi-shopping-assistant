@@ -6,6 +6,7 @@ import hashlib
 import logging
 from pathlib import Path
 import re
+import threading
 import time
 from typing import Any
 from uuid import uuid4
@@ -26,7 +27,7 @@ from satmi_agent.observability import (
     record_request,
 )
 from satmi_agent.persistence import engine, persistence_service
-from satmi_agent.queueing import cancellation_queue_service
+from satmi_agent.queueing import cancellation_queue_service, conversation_intent_queue_service
 from satmi_agent.schemas import (
     ChatTranscriptResponse,
     AdminChatHistoryEvent,
@@ -34,12 +35,15 @@ from satmi_agent.schemas import (
     ChatRequest,
     ChatResponse,
     ConversationEventResponse,
+    ConversationIntentOverrideRequest,
     DashboardAnalyticsSummary,
     DashboardCategorySlice,
     DashboardChatMessage,
     DashboardChatSession,
+    DashboardDailyActivity,
     DashboardExportRow,
     DashboardIntentSlice,
+    DashboardIntentSubcategorySlice,
     DashboardSnapshotResponse,
     DashboardTopTrend,
     HandoffStatusUpdateRequest,
@@ -49,6 +53,7 @@ from satmi_agent.schemas import (
     SearchTermCount,
     SearchTermTrendPoint,
     WeeklyInsightCard,
+    AdminCommentRequest,
 )
 from satmi_agent.security import (
     enforce_chat_rate_limit,
@@ -90,13 +95,50 @@ async def _warm_catalog_cache() -> None:
         return
 
 
+def _run_intent_worker_loop(stop_event: threading.Event):
+    import time
+    import sys
+    import os
+    # Ensure scripts dir is importable
+    scripts_dir = os.path.join(os.path.dirname(__file__), "..", "..", "scripts")
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, os.path.abspath(scripts_dir))
+    from process_conversation_intent_queue import TokenBucket, process_batch
+
+    bucket = TokenBucket(capacity=15, fill_rate_per_sec=15.0 / 60.0)
+    while not stop_event.is_set():
+        if bucket.tokens < 2.0:
+            stop_event.wait(timeout=5.0)
+            continue
+        try:
+            processed_count = process_batch(max_batch_size=5)
+            if processed_count > 0:
+                bucket.consume(1)
+            else:
+                stop_event.wait(timeout=1.0)
+        except Exception as e:
+            stop_event.wait(timeout=5.0)
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     persistence_service.init_db()
     await _warm_catalog_cache()
     ensure_firebase_ready_or_raise()
     setup_tracing()
+
+    # Run the background intent classifier worker inline
+    stop_event = threading.Event()
+    worker_task = asyncio.create_task(
+        asyncio.to_thread(_run_intent_worker_loop, stop_event)
+    )
+
     yield
+
+    # Teardown
+    stop_event.set()
+    worker_task.cancel()
+
 
 
 app = FastAPI(title="SATMI Agent API", version="0.1.0", lifespan=lifespan)
@@ -126,7 +168,7 @@ def _cors_allow_origins() -> list[str]:
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_allow_origins(),
-    allow_origin_regex=r"https?://(([a-zA-Z0-9-]+\.)?(myshopify\.com|shopify\.com|vercel\.app)|localhost|127\.0\.0\.1|192\.168\.\d+\.\d+)(:\d+)?$",
+    allow_origin_regex=r"https?://(([a-zA-Z0-9-]+\.)*(myshopify\.com|shopify\.com|vercel\.app)|localhost|127\.0\.0\.1|192\.168\.\d+\.\d+)(:\d+)?$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -276,6 +318,43 @@ def _record_chat_analytics_safe(
 def _ensure_admin_analytics_enabled() -> None:
     if not settings.analytics_admin_panel_enabled:
         raise HTTPException(status_code=404, detail="Analytics admin endpoints disabled")
+
+
+def _queue_conversation_intent_classification_safe(
+    *,
+    conversation_id: str,
+    user_id: str,
+    force: bool,
+    transcript_checksum: str | None = None,
+) -> None:
+    if not settings.conversation_intent_classifier_enabled:
+        return
+    try:
+        conversation_intent_queue_service.enqueue_classification(
+            conversation_id=conversation_id,
+            user_id=user_id,
+            force=force,
+            transcript_checksum=transcript_checksum,
+        )
+    except Exception as exc:  # pragma: no cover
+        logger.warning("Unable to enqueue conversation intent classification: %s", exc)
+
+
+def _enqueue_inactive_conversation_intents(*, limit: int, inactive_minutes: int) -> int:
+    candidates = persistence_service.list_inactive_conversations_needing_intent_classification(
+        inactive_minutes=inactive_minutes,
+        limit=limit,
+    )
+    queued = 0
+    for item in candidates:
+        _queue_conversation_intent_classification_safe(
+            conversation_id=str(item.get("conversation_id") or ""),
+            user_id=str(item.get("user_id") or "unknown"),
+            force=False,
+            transcript_checksum=str(item.get("transcript_checksum") or ""),
+        )
+        queued += 1
+    return queued
 
 
 def _load_recent_message_history(conversation_id: str, limit: int = 12) -> list[dict[str, str]]:
@@ -439,6 +518,9 @@ def system_config(_: None = Depends(require_support_role)) -> dict[str, object]:
         "llm_provider": settings.llm_provider,
         "model_name": settings.model_name,
         "gemini_api_key": _mask_secret(settings.gemini_api_key),
+        "gemini_intent_classifier_api_key": _mask_secret(settings.gemini_intent_classifier_api_key),
+        "conversation_intent_raw_mode": settings.conversation_intent_raw_mode,
+        "conversation_intent_allow_heuristic_fallback": settings.conversation_intent_allow_heuristic_fallback,
         "shopify_store_domain": settings.shopify_store_domain,
         "shopify_admin_api_token": _mask_secret(settings.shopify_admin_api_token),
         "display_currency_code": settings.display_currency_code,
@@ -536,6 +618,19 @@ def chat(
         ]
 
     persistence_service.upsert_handoff_from_state(final_state)
+    
+    recommended_products = _safe_recommended_products(_coerce_recommended_products(final_state))
+    
+    event_meta = {
+        "handoff_reason": final_state.get("handoff_reason"),
+        "errors": scrub_pii(final_state.get("errors", [])),
+        "internal_logs": scrub_pii(final_state.get("internal_logs", [])),
+    }
+    
+    if final_state.get("action") in ("search_products", "knowledge_and_search") and recommended_products:
+        event_meta["tool_action"] = "search_products"
+        event_meta["tool_result"] = {"results": recommended_products}
+
     persistence_service.create_conversation_event(
         conversation_id=request.conversation_id,
         user_id=request.user_id,
@@ -546,16 +641,11 @@ def chat(
         confidence=final_state.get("confidence"),
         action=final_state.get("action"),
         handoff_id=final_state.get("handoff_id"),
-        event_metadata={
-            "handoff_reason": final_state.get("handoff_reason"),
-            "errors": scrub_pii(final_state.get("errors", [])),
-            "internal_logs": scrub_pii(final_state.get("internal_logs", [])),
-        },
+        event_metadata=event_meta,
     )
 
     status_value = final_state.get("status", "active")
     intent_value = _normalize_chat_intent(final_state.get("intent", "unknown"))
-    recommended_products = _safe_recommended_products(_coerce_recommended_products(final_state))
     recommendation_source = (final_state.get("tool_result") or {}).get("source")
 
     if settings.analytics_enabled:
@@ -568,6 +658,15 @@ def chat(
             recommendation_count=len(recommended_products),
             latency_seconds=time.perf_counter() - chat_started_at,
         )
+
+    # Queue conversation-level classification asynchronously after every assistant turn.
+    # This keeps chat latency unaffected while making dashboard intent labels update continuously.
+    background_tasks.add_task(
+        _queue_conversation_intent_classification_safe,
+        conversation_id=request.conversation_id,
+        user_id=request.user_id,
+        force=False,
+    )
 
     record_chat_outcome(status=status_value, intent=intent_value)
     if final_state.get("handoff_id"):
@@ -665,6 +764,7 @@ def admin_chat_history(
             status=row["status"],
             intent=row.get("intent"),
             created_at=row["created_at"],
+            event_metadata=row.get("event_metadata") if isinstance(row.get("event_metadata"), dict) else None,
         )
         for row in rows
     ]
@@ -674,10 +774,32 @@ def admin_chat_history(
 def admin_dashboard_snapshot(
     limit: int = Query(default=10, ge=1, le=150),
     offset: int = Query(default=0, ge=0),
+    start_date: str | None = Query(default=None),
+    end_date: str | None = Query(default=None),
     _: None = Depends(require_support_role),
 ) -> DashboardSnapshotResponse:
+    from datetime import datetime
     _ensure_admin_analytics_enabled()
-    snapshot = persistence_service.list_dashboard_chat_sessions(limit=limit, offset=offset)
+    
+    dt_start = None
+    dt_end = None
+    if start_date:
+        try:
+            dt_start = datetime.fromisoformat(start_date)
+        except ValueError:
+            pass
+    if end_date:
+        try:
+            dt_end = datetime.fromisoformat(end_date)
+        except ValueError:
+            pass
+
+    snapshot = persistence_service.list_dashboard_chat_sessions(
+        limit=limit, 
+        offset=offset,
+        start_date=dt_start,
+        end_date=dt_end
+    )
 
     chats = [
         DashboardChatSession(
@@ -686,7 +808,18 @@ def admin_dashboard_snapshot(
             is_frustrated=bool(row["is_frustrated"]),
             status=row["status"],
             dominant_category=row["dominant_category"],
-            dominant_intent=row.get("dominant_intent", "General Inquiry"),
+            dominant_intent=row.get("dominant_intent", "Unclassified"),
+            intent_confidence=row.get("intent_confidence"),
+            intent_model_name=row.get("intent_model_name"),
+            intent_model_version=row.get("intent_model_version"),
+            intent_source_version=row.get("intent_source_version"),
+            intent_needs_review=row.get("intent_needs_review"),
+            intent_is_overridden=bool(row.get("intent_is_overridden", False)),
+            intent_override_reason=row.get("intent_override_reason"),
+            intent_raw_label=row.get("intent_raw_label"),
+            intent_classifier_mode=row.get("intent_classifier_mode"),
+            intent_classifier_error=row.get("intent_classifier_error"),
+            intent_classifier_total_tokens=row.get("intent_classifier_total_tokens"),
             started_at=row["started_at"],
             last_activity_at=row["last_activity_at"],
         )
@@ -695,9 +828,12 @@ def admin_dashboard_snapshot(
 
     analytics = DashboardAnalyticsSummary(
         resolution_rate=float(snapshot.get("resolution_rate", 0.0)),
+        recommendation_conversions=int(snapshot.get("recommendation_conversions", 0)),
         category_divide=[DashboardCategorySlice(**item) for item in snapshot.get("category_divide", [])],
         intent_breakdown=[DashboardIntentSlice(**item) for item in snapshot.get("intent_breakdown", [])],
+        intent_subcategory_breakdown=[DashboardIntentSubcategorySlice(**item) for item in snapshot.get("intent_subcategory_breakdown", [])],
         top_trending_terms=[DashboardTopTrend(**item) for item in snapshot.get("top_trending_terms", [])],
+        daily_activity=[DashboardDailyActivity(**item) for item in snapshot.get("daily_activity", [])],
     )
 
     return DashboardSnapshotResponse(
@@ -705,6 +841,132 @@ def admin_dashboard_snapshot(
         chats=chats,
         analytics=analytics
     )
+
+
+@app.post("/admin/dashboard/chat/{conversation_id}/intent-override")
+def admin_set_intent_override(
+    conversation_id: str,
+    request: ConversationIntentOverrideRequest,
+    x_support_email: str | None = Header(default=None, alias="X-Support-Email"),
+    _: None = Depends(require_support_role),
+) -> dict[str, Any]:
+    _ensure_admin_analytics_enabled()
+    persistence_service.upsert_conversation_intent_override(
+        conversation_id=conversation_id,
+        intent_label=request.intent_label,
+        override_reason=request.override_reason,
+        overridden_by=request.overridden_by or x_support_email or "admin",
+    )
+    label = persistence_service.get_conversation_intent_label(conversation_id)
+    return {
+        "conversation_id": conversation_id,
+        "saved": True,
+        "label": label,
+    }
+
+
+@app.delete("/admin/dashboard/chat/{conversation_id}/intent-override")
+def admin_clear_intent_override(
+    conversation_id: str,
+    _: None = Depends(require_support_role),
+) -> dict[str, Any]:
+    _ensure_admin_analytics_enabled()
+    persistence_service.clear_conversation_intent_override(conversation_id)
+    label = persistence_service.get_conversation_intent_label(conversation_id)
+    return {
+        "conversation_id": conversation_id,
+        "cleared": True,
+        "label": label,
+    }
+
+
+@app.post("/admin/dashboard/intent-classifier/backfill")
+def admin_enqueue_intent_backfill(
+    limit: int = Query(default=settings.conversation_intent_backfill_batch_size, ge=1, le=2000),
+    inactive_minutes: int = Query(default=settings.conversation_intent_inactive_minutes, ge=1, le=1440),
+    _: None = Depends(require_support_role),
+) -> dict[str, Any]:
+    _ensure_admin_analytics_enabled()
+    queued = _enqueue_inactive_conversation_intents(limit=limit, inactive_minutes=inactive_minutes)
+    return {
+        "queued": queued,
+        "limit": limit,
+        "inactive_minutes": inactive_minutes,
+    }
+
+
+@app.post("/admin/dashboard/chat/{conversation_id}/intent-classifier/backfill")
+def admin_run_conversation_intent_classification(
+    conversation_id: str,
+    _: None = Depends(require_support_role),
+) -> dict[str, Any]:
+    _ensure_admin_analytics_enabled()
+    source_limit = max(int(getattr(settings, "conversation_intent_source_event_limit", 120) or 120), 1)
+
+    events = persistence_service.list_conversation_events_for_classification(
+        conversation_id,
+        limit=source_limit,
+    )
+    if not events:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    from satmi_agent.conversation_intent_classifier import classify_conversation_intent
+    result = classify_conversation_intent(conversation_id=conversation_id, force=True)
+
+    return {
+        "status": "completed",
+        "conversation_id": conversation_id,
+        "result": result,
+    }
+
+
+@app.post("/admin/dashboard/chat/{conversation_id}/comment")
+def admin_add_chat_comment(
+    conversation_id: str,
+    request: AdminCommentRequest,
+    x_support_email: str | None = Header(default=None, alias="X-Support-Email"),
+    _: None = Depends(require_support_role),
+) -> dict[str, Any]:
+    _ensure_admin_analytics_enabled()
+    
+    # We use user_id="admin" and role="system" with special metadata
+    event_meta = {"is_admin_comment": True}
+    if x_support_email:
+        event_meta["admin_email"] = x_support_email
+
+    persistence_service.create_conversation_event(
+        conversation_id=conversation_id,
+        user_id="admin",
+        role="system",
+        message=request.message,
+        status="active",
+        intent=None,
+        confidence=None,
+        action="admin_comment",
+        handoff_id=None,
+        event_metadata=event_meta,
+    )
+    
+    return {
+        "status": "completed",
+        "conversation_id": conversation_id,
+    }
+
+
+@app.delete("/admin/dashboard/chat/{conversation_id}")
+def admin_delete_chat_conversation(
+    conversation_id: str,
+    _: None = Depends(require_support_role),
+) -> dict[str, Any]:
+    _ensure_admin_analytics_enabled()
+    deleted = persistence_service.delete_conversation(conversation_id)
+    if sum(deleted.values()) == 0:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    return {
+        "conversation_id": conversation_id,
+        "deleted": deleted,
+    }
 
 
 @app.get("/admin/dashboard/export", response_model=list[DashboardExportRow])
@@ -891,7 +1153,59 @@ def admin_chat_transcript(
                 message=scrub_pii(item["message"]),
                 created_at=item["created_at"],
                 intent=item.get("intent"),
+                event_metadata=item.get("event_metadata") or {},
             )
             for item in transcript
         ]
     )
+
+import json
+
+@app.get("/admin/categories")
+def get_admin_categories(_: None = Depends(require_support_role)) -> list[str]:
+    path = Path("data/categories.json")
+    if not path.exists():
+        return ["Other"]
+    try:
+        return json.loads(path.read_text("utf-8"))
+    except Exception:
+        return ["Other"]
+
+@app.put("/admin/categories")
+def update_admin_categories(categories: list[str], _: None = Depends(require_support_role)) -> list[str]:
+    path = Path("data/categories.json")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(categories, indent=2), "utf-8")
+    return categories
+
+@app.post("/admin/conversations/{conversation_id}/intent")
+def override_conversation_intent(
+    conversation_id: str,
+    request: ConversationIntentOverrideRequest,
+    _: None = Depends(require_support_role),
+):
+    persistence_service.upsert_conversation_intent_label(
+        conversation_id=conversation_id,
+        intent_label=request.intent_label,
+        confidence=1.0,
+        rationale_short="Manual override via dashboard.",
+        model_name="human",
+        model_version="human",
+        source_version="manual",
+        needs_review=False,
+        transcript_checksum="manual",
+        intent_subcategory=request.category,
+    )
+    return {"status": "ok"}
+
+@app.post("/admin/conversations/{conversation_id}/reclassify")
+def reclassify_conversation_intent(
+    conversation_id: str,
+    _: None = Depends(require_support_role),
+):
+    result = conversation_intent_queue_service.enqueue_classification(
+        conversation_id=conversation_id,
+        user_id="admin",
+        force=True,
+    )
+    return {"status": "ok", "task_id": result["task_id"]}

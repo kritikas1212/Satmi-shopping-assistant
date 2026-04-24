@@ -21,7 +21,7 @@ class ChatResponse(BaseModel):
     response_text: str
     recommended_products: list[dict[str, Any]] = Field(default_factory=list)
     auth_required: bool = False
-    intent: Literal["shopping", "order_tracking", "policy_brand_faq", "general", "authentication", "unknown"]
+    intent: str
     confidence: float
     handoff_id: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -32,13 +32,18 @@ class HandoffTicket(BaseModel):
     conversation_id: str
     summary: str
     reason: str
-    intent: Literal["shopping", "order_tracking", "policy_brand_faq", "general", "authentication", "unknown"]
+    intent: str
     attempted_action: str | None = None
     tool_result: dict[str, Any] = Field(default_factory=dict)
     errors: list[str] = Field(default_factory=list)
 
 
 HandoffStatus = Literal["open", "in_progress", "resolved"]
+
+
+class ConversationIntentOverrideRequest(BaseModel):
+    intent_label: str
+    category: str
 
 
 class HandoffStatusUpdateRequest(BaseModel):
@@ -149,6 +154,7 @@ class AdminChatHistoryEvent(BaseModel):
     status: str
     intent: str | None = None
     created_at: str
+    event_metadata: dict[str, Any] | None = None
 
 
 class DashboardChatMessage(BaseModel):
@@ -156,6 +162,7 @@ class DashboardChatMessage(BaseModel):
     message: str
     created_at: str
     intent: str | None = None
+    event_metadata: dict[str, Any] | None = None
 
 
 class DashboardChatSession(BaseModel):
@@ -163,8 +170,19 @@ class DashboardChatSession(BaseModel):
     user_id_hash: str
     is_frustrated: bool
     status: Literal["Resolved", "Abandoned"]
-    dominant_category: Literal["Order Tracking", "Product Search", "Returns", "Policy & FAQ", "General"]
+    dominant_category: str
     dominant_intent: str
+    intent_confidence: float | None = None
+    intent_model_name: str | None = None
+    intent_model_version: str | None = None
+    intent_source_version: str | None = None
+    intent_needs_review: bool | None = None
+    intent_is_overridden: bool = False
+    intent_override_reason: str | None = None
+    intent_raw_label: str | None = None
+    intent_classifier_mode: str | None = None
+    intent_classifier_error: str | None = None
+    intent_classifier_total_tokens: int | None = None
     started_at: str
     last_activity_at: str
 
@@ -175,7 +193,7 @@ class ChatTranscriptResponse(BaseModel):
 
 
 class DashboardCategorySlice(BaseModel):
-    category: Literal["Order Tracking", "Product Search", "Returns", "Policy & FAQ", "General"]
+    category: str
     count: int
     percentage: float
 
@@ -191,11 +209,25 @@ class DashboardTopTrend(BaseModel):
     count: int
 
 
+class DashboardIntentSubcategorySlice(BaseModel):
+    parent_intent: str
+    subcategory: str
+    count: int
+
+
+class DashboardDailyActivity(BaseModel):
+    date: str
+    sessions: int
+
+
 class DashboardAnalyticsSummary(BaseModel):
     resolution_rate: float
+    recommendation_conversions: int = 0
     category_divide: list[DashboardCategorySlice] = Field(default_factory=list)
     intent_breakdown: list[DashboardIntentSlice] = Field(default_factory=list)
+    intent_subcategory_breakdown: list[DashboardIntentSubcategorySlice] = Field(default_factory=list)
     top_trending_terms: list[DashboardTopTrend] = Field(default_factory=list)
+    daily_activity: list[DashboardDailyActivity] = Field(default_factory=list)
 
 
 class DashboardSnapshotResponse(BaseModel):
@@ -212,5 +244,18 @@ class DashboardExportRow(BaseModel):
     dominant_intent: str
     role: str
     intent: str | None = None
+    intent_confidence: float | None = None
+    intent_model_version: str | None = None
+    intent_raw_label: str | None = None
+    intent_classifier_mode: str | None = None
     message: str
     created_at: str
+
+
+class ConversationIntentOverrideRequest(BaseModel):
+    intent_label: str = Field(..., min_length=3, max_length=64)
+    override_reason: str = Field(..., min_length=3, max_length=500)
+    overridden_by: str | None = Field(default="admin", max_length=128)
+
+class AdminCommentRequest(BaseModel):
+    message: str = Field(..., min_length=1)

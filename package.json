@@ -7,7 +7,5 @@
     "build:frontend": "npm --prefix satmi-frontend run build",
     "dev:backend": "./scripts/start_local_stack.sh"
   },
-  "dependencies": {
-    "firebase": "^12.11.0"
-  }
+  "dependencies": {}
 }
