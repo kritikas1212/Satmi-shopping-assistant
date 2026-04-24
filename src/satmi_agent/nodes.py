@@ -359,24 +359,27 @@ def _extract_search_query(message: str, policy_context: list[dict[str, str]] | N
     llm_query = extract_search_keywords_with_llm(user_message=message, policy_context=policy_context)
     if llm_query:
         cleaned_llm_query = " ".join(llm_query.split()).strip()
-        return cleaned_llm_query or DEFAULT_DISCOVERY_QUERY
+        # Guard against LLM returning garbage (< 3 chars total)
+        if cleaned_llm_query and len(cleaned_llm_query) >= 3:
+            return cleaned_llm_query
 
     text = " ".join((message or "").split()).strip().lower()
     if not text:
         return DEFAULT_DISCOVERY_QUERY
 
     tokens = re.findall(r"[a-zA-Z0-9']+", text)
-    filtered = [tok for tok in tokens if tok not in SEARCH_STOPWORDS and len(tok) > 1]
+    # Filter stopwords AND require minimum 3 chars per token
+    filtered = [tok for tok in tokens if tok not in SEARCH_STOPWORDS and len(tok) >= 3]
 
     if not filtered:
-        filtered = [tok for tok in tokens if len(tok) > 1]
+        filtered = [tok for tok in tokens if len(tok) >= 3]
     if not filtered:
         return DEFAULT_DISCOVERY_QUERY
 
-    preferred = [tok for tok in filtered if tok in PRODUCT_INFO_KEYWORDS or tok in {"karungali", "rudraksha", "crystal"}]
+    preferred = [tok for tok in filtered if tok in PRODUCT_INFO_KEYWORDS or tok in {"karungali", "rudraksha", "crystal", "pyrite", "quartz"}]
     query_tokens = preferred if preferred else filtered
     cleaned_query = " ".join(query_tokens).strip()
-    return cleaned_query or DEFAULT_DISCOVERY_QUERY
+    return cleaned_query if len(cleaned_query) >= 3 else DEFAULT_DISCOVERY_QUERY
 
 
 def _is_comparison_request(message: str, words: set[str]) -> bool:

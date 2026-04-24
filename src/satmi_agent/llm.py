@@ -21,7 +21,7 @@ MAX_OUTPUT_TOKENS = 4096
 
 _DEFAULT_GEMINI_FALLBACK_MODELS = (
     "gemini-2.5-flash",
-    "gemini-1.5-flash",
+    "gemini-2.0-flash",
 )
 
 
@@ -300,11 +300,31 @@ def _parse_intent_json(raw: str) -> tuple[str, float] | None:
 
 
 def extract_search_keywords_with_llm(*, user_message: str, policy_context: list[dict[str, str]] | None = None) -> str | None:
-    """Extract a concise 1-3 word product search query from conversational text."""
+    """Extract a concise product search query from conversational text."""
     if settings.llm_provider.lower() != "gemini":
         return None
     if not settings.gemini_api_key:
         return None
+
+    # Spiritual benefit → product name mapping (offline fast-path)
+    # Avoids extra LLM call for common need-based queries
+    _BENEFIT_TO_PRODUCT: list[tuple[re.Pattern, str]] = [
+        (re.compile(r"\b(best.sell|bestsell|trending|popular|top.product|most.popular|most.sought)\b", re.I), "Karungali Rudraksha Rose Quartz"),
+        (re.compile(r"\b(anxiety|stress|calm|nervous|worry|panic)\b", re.I), "Rudraksha Amethyst"),
+        (re.compile(r"\b(wealth|money|prosperity|abundance|financial|rich|luck)\b", re.I), "Pyrite"),
+        (re.compile(r"\b(love|relationship|marriage|heart|romantic)\b", re.I), "Rose Quartz"),
+        (re.compile(r"\b(protection|negativ|evil|bad energy)\b", re.I), "Karungali Rudraksha"),
+        (re.compile(r"\b(spiritual|meditation|growth|awareness|divine)\b", re.I), "Rudraksha Karungali"),
+        (re.compile(r"\b(healing|wellness|well.being)\b", re.I), "Rudraksha Crystal"),
+        (re.compile(r"\b(confidence|courage|strength|power)\b", re.I), "Pyrite Tiger Eye"),
+        (re.compile(r"\b(chakra|energy|balance)\b", re.I), "Crystal Rudraksha"),
+        (re.compile(r"\b(karungali)\b", re.I), "Karungali"),
+        (re.compile(r"\b(rudraksha)\b", re.I), "Rudraksha"),
+        (re.compile(r"\b(mala|bracelet|crystal|pyrite|quartz)\b", re.I), "Karungali Rudraksha mala"),
+    ]
+    for pattern, product in _BENEFIT_TO_PRODUCT:
+        if pattern.search(user_message):
+            return product
 
     context_str = ""
     if policy_context:
@@ -314,10 +334,10 @@ def extract_search_keywords_with_llm(*, user_message: str, policy_context: list[
     prompt = (
         "Extract a concise product search query from the user's message.\n"
         "CRITICAL RULES:\n"
-        "- If the user specifies a known product (e.g., 'Karungali', '5 Mukhi'), output that product name.\n"
-        "- If the user expresses a need (e.g., 'attracting money', 'anxiety relief', 'protection'), you MUST consult the provided Knowledge Base Context below to determine the correct product for that need, and output ONLY that product's name (e.g., 'Pyrite', 'Amethyst').\n"
-        "- Output ONLY the query text, no JSON, no labels, no punctuation wrapper.\n"
-        "- Query must be 1 to 3 words.\n\n"
+        "- If the user specifies a known product (e.g., 'Karungali', '5 Mukhi Rudraksha'), output that product name.\n"
+        "- If the user expresses a need (e.g., 'attracting money', 'anxiety relief'), output the relevant product name from SATMI catalog (e.g., 'Pyrite', 'Rudraksha Amethyst').\n"
+        "- Output ONLY the product search term, no JSON, no labels, no punctuation.\n"
+        "- Query can be 1 to 5 words. Longer is fine if it adds specificity.\n\n"
         f"{context_str}"
         f"User message: {user_message}"
     )
@@ -329,7 +349,7 @@ def extract_search_keywords_with_llm(*, user_message: str, policy_context: list[
     payload = {
         "system_instruction": {"parts": [{"text": SATMI_SYSTEM_PROMPT}]},
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.0, "maxOutputTokens": 24},
+        "generationConfig": {"temperature": 0.0, "maxOutputTokens": 128},
     }
 
     body = _post_gemini_json(
@@ -354,10 +374,24 @@ def extract_search_keywords_with_llm(*, user_message: str, policy_context: list[
     if not raw:
         return None
 
-    tokens = re.findall(r"[a-zA-Z0-9']+", raw.lower())
+    # Strip common LLM preamble patterns before extracting tokens
+    # e.g. "Namaste! The product is: Karungali" → "Karungali"
+    for preamble in ["namaste", "sure", "the product is", "search for", "query:", "answer:", "for", "here"]:
+        if raw.lower().startswith(preamble):
+            raw = raw[len(preamble):].strip().lstrip("!:,.- ").strip()
+            break
+
+    # Clean up but allow up to 6 words
+    tokens = re.findall(r"[a-zA-Z0-9']+", raw)
     if not tokens:
         return None
-    return " ".join(tokens[:3])
+    # Reject garbage: filter tokens shorter than 2 chars
+    valid_tokens = [t for t in tokens if len(t) >= 2]
+    if not valid_tokens:
+        return None
+    result = " ".join(valid_tokens[:6])
+    # Final sanity check - must be at least 3 chars total
+    return result if len(result) >= 3 else None
 
 
 def classify_intent_with_llm(*, user_message: str, message_history: list[dict[str, str]] | None = None) -> tuple[str, float] | None:
