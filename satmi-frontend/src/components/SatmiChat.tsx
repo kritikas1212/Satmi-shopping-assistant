@@ -65,6 +65,28 @@ function formatTaskResult(result?: Record<string, unknown>): string {
   return `Task completed.\n\n\`\`\`json\n${JSON.stringify(result, null, 2)}\n\`\`\``;
 }
 
+function cleanMessageContent(content: string): string {
+  if (!content) return "";
+  
+  const trimmed = content.trim();
+  
+  // Strip markdown code blocks containing JSON
+  let cleaned = trimmed.replace(/```(?:json)?[\s\S]*?```/gi, "").trim();
+  
+  // Hide pure JSON objects (like {"query": ...})
+  try {
+    if (cleaned.startsWith("{") && cleaned.endsWith("}")) {
+      JSON.parse(cleaned);
+      // If it parsed successfully, it's raw JSON leaking. Return fallback or empty.
+      return "I have found some excellent options for you below.";
+    }
+  } catch (e) {
+    // Not valid JSON, continue
+  }
+  
+  return cleaned;
+}
+
 export default function SatmiChat() {
   const [hydrated, setHydrated] = useState(false);
   const [isOpen, setIsOpen] = useState(false);
@@ -314,9 +336,14 @@ export default function SatmiChat() {
                 type="button"
                 onClick={handleNewChat}
                 disabled={isSending || isPollingTask}
-                className="rounded-lg border border-[#D7C5B5] px-2.5 py-1 text-xs font-medium text-[#7A1E1E] hover:bg-[#EFE7DE] disabled:cursor-not-allowed disabled:opacity-60"
+                className="inline-flex h-7 w-7 items-center justify-center rounded-lg border border-[#D7C5B5] text-[#7A1E1E] hover:bg-[#EFE7DE] disabled:cursor-not-allowed disabled:opacity-60"
+                aria-label="New Chat"
               >
-                New Chat
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="h-4 w-4">
+                  <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+                  <path d="M12 7v6" />
+                  <path d="M9 10h6" />
+                </svg>
               </button>
               <button
                 type="button"
@@ -330,11 +357,16 @@ export default function SatmiChat() {
           </header>
 
           <div ref={scrollRef} className="flex-1 min-h-0 space-y-4 overflow-y-auto bg-[#F9F6F2] px-4 py-4">
-            {messages.map((message, index) => (
+            {messages.map((message, index) => {
+              const displayContent = message.role === "assistant" 
+                ? cleanMessageContent(message.content) 
+                : message.content;
+                
+              return (
               <div key={message.id} className={`max-w-[92%] ${message.role === "user" ? "ml-auto" : ""}`}>
                 <ChatBubble
                   role={message.role}
-                  content={message.content}
+                  content={displayContent}
                   recommendedProducts={message.recommended_products || []}
                 />
 
@@ -354,7 +386,7 @@ export default function SatmiChat() {
                   </div>
                 )}
               </div>
-            ))}
+            )})}
 
             {isSending && !isPollingTask && (
               <div className="max-w-[92%] mb-4">
