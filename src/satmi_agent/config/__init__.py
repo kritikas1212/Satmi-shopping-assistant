@@ -48,6 +48,7 @@ class Settings(BaseSettings):
     usd_to_inr_rate: float = 83.0
     firebase_auth_enabled: bool = False
     firebase_credentials_path: str | None = None
+    firebase_credentials_json: str | None = None
     firebase_project_id: str | None = None
     firebase_require_for_sensitive_actions: bool = True
     catalog_cache_enabled: bool = True
