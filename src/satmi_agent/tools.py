@@ -305,10 +305,26 @@ class ToolingService:
         product_type = str(product.get("product_type", "")).lower()
         tags = str(product.get("tags", "")).lower()
 
-        # Expand tokens with benefit-driven product keywords
+        score = 0
+        query_l = query.lower().strip()
+
+        # ---- PHASE 1: Multi-word phrase match (highest priority) ----
+        # If the query has 2+ words and appears as an exact phrase in the title,
+        # give a massive bonus. This ensures "Seven Chakra" → "Pyrite x Seven Chakra Band"
+        if len(tokens) >= 2 and query_l in title:
+            score += 10  # Dominant match
+        elif len(tokens) >= 2 and query_l in searchable:
+            score += 5   # Found in description/tags but not title
+
+        # Check all consecutive 2-word pairs from query in title
+        for i in range(len(tokens) - 1):
+            bigram = f"{tokens[i]} {tokens[i+1]}"
+            if bigram in title:
+                score += 6
+
+        # ---- PHASE 2: Expand with benefit keywords for need-based queries ----
         expanded_tokens = self._expand_query_with_benefits(query, tokens)
 
-        score = 0
         matched_any = False
         for token in expanded_tokens:
             if token in title:
@@ -321,9 +337,6 @@ class ToolingService:
                 score += 1
                 matched_any = True
 
-        query_l = query.lower().strip()
-        if query_l and query_l in title:
-            score += 4
         # Bonus if ALL original (non-expanded) tokens match — strong relevance signal
         if tokens and all(token in searchable for token in tokens):
             score += 2

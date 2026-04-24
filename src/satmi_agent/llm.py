@@ -306,25 +306,64 @@ def extract_search_keywords_with_llm(*, user_message: str, policy_context: list[
     if not settings.gemini_api_key:
         return None
 
-    # Spiritual benefit → product name mapping (offline fast-path)
-    # Avoids extra LLM call for common need-based queries
+    # ---- TIER 1: Exact/specific product name detection ----
+    # If the user names a specific product from our catalog, pass it through directly.
+    # This MUST run before benefit mapping to prevent "seven chakra" being hijacked by "chakra" pattern.
+    _PRODUCT_NAME_PATTERNS: list[tuple[re.Pattern, str]] = [
+        # Multi-word product names (must be checked first - more specific)
+        (re.compile(r"\bseven\s*chakra\b", re.I), "Seven Chakra"),
+        (re.compile(r"\brose\s*quartz\b", re.I), "Rose Quartz"),
+        (re.compile(r"\btiger\s*eye\b", re.I), "Tiger Eye"),
+        (re.compile(r"\bblack\s*obsidian\b", re.I), "Black Obsidian"),
+        (re.compile(r"\btriple\s*protection\b", re.I), "Triple Protection"),
+        (re.compile(r"\bmoney\s*magnet\b", re.I), "Money Magnet"),
+        (re.compile(r"\b5\s*mukhi\b", re.I), "5 Mukhi Rudraksha"),
+        (re.compile(r"\b7\s*mukhi\b", re.I), "7 Mukhi Rudraksha"),
+        (re.compile(r"\bpanch\s*mukhi\b", re.I), "5 Mukhi Rudraksha"),
+        (re.compile(r"\bkhatu\s*shyam\b", re.I), "Khatu Shyam"),
+        (re.compile(r"\bhanuman\b", re.I), "Hanuman Karungali"),
+        (re.compile(r"\bmurugan\b", re.I), "Murugan Karungali"),
+        (re.compile(r"\btrishul\b", re.I), "Trishul Karungali"),
+        (re.compile(r"\badi\s*yogi\b", re.I), "Adi Yogi Karungali"),
+        (re.compile(r"\bdreamy\s*duo\b", re.I), "Dreamy Duo Rose Quartz Amethyst"),
+        # Single-word product names
+        (re.compile(r"\bkarungali\b", re.I), "Karungali"),
+        (re.compile(r"\brudraksha\b", re.I), "Rudraksha"),
+        (re.compile(r"\bpyrite\b", re.I), "Pyrite"),
+        (re.compile(r"\bamethyst\b", re.I), "Amethyst"),
+        (re.compile(r"\bcarnelian\b", re.I), "Seven Chakra"),
+        (re.compile(r"\baventurine\b", re.I), "Seven Chakra"),
+        (re.compile(r"\bhematite\b", re.I), "Triple Protection"),
+    ]
+    for pattern, query in _PRODUCT_NAME_PATTERNS:
+        if pattern.search(user_message):
+            return query
+
+    # ---- TIER 2: Best sellers / generic discovery ----
+    if re.search(r"\b(best.?sell|bestsell|trending|popular|top.?product|most.?popular|most.?sought)\b", user_message, re.I):
+        return "Karungali Rudraksha Rose Quartz"
+
+    # ---- TIER 3: Spiritual benefit → product mapping ----
+    # Only fires for truly abstract need-based queries with no product name
     _BENEFIT_TO_PRODUCT: list[tuple[re.Pattern, str]] = [
-        (re.compile(r"\b(best.sell|bestsell|trending|popular|top.product|most.popular|most.sought)\b", re.I), "Karungali Rudraksha Rose Quartz"),
-        (re.compile(r"\b(anxiety|stress|calm|nervous|worry|panic)\b", re.I), "Rudraksha Amethyst"),
+        (re.compile(r"\b(anxiety|stress|calm|nervous|worry|panic)\b", re.I), "Rudraksha"),
         (re.compile(r"\b(wealth|money|prosperity|abundance|financial|rich|luck)\b", re.I), "Pyrite"),
-        (re.compile(r"\b(love|relationship|marriage|heart|romantic)\b", re.I), "Rose Quartz"),
-        (re.compile(r"\b(protection|negativ|evil|bad energy)\b", re.I), "Karungali Rudraksha"),
-        (re.compile(r"\b(spiritual|meditation|growth|awareness|divine)\b", re.I), "Rudraksha Karungali"),
-        (re.compile(r"\b(healing|wellness|well.being)\b", re.I), "Rudraksha Crystal"),
+        (re.compile(r"\b(love|relationship|marriage|romantic|compassion)\b", re.I), "Rose Quartz"),
+        (re.compile(r"\b(protection|negativ|evil)\b", re.I), "Karungali Rudraksha"),
+        (re.compile(r"\b(spiritual|meditation|divine)\b", re.I), "Rudraksha Karungali"),
+        (re.compile(r"\b(healing|wellness)\b", re.I), "Rudraksha"),
         (re.compile(r"\b(confidence|courage|strength|power)\b", re.I), "Pyrite Tiger Eye"),
-        (re.compile(r"\b(chakra|energy|balance)\b", re.I), "Crystal Rudraksha"),
-        (re.compile(r"\b(karungali)\b", re.I), "Karungali"),
-        (re.compile(r"\b(rudraksha)\b", re.I), "Rudraksha"),
-        (re.compile(r"\b(mala|bracelet|crystal|pyrite|quartz)\b", re.I), "Karungali Rudraksha mala"),
+        (re.compile(r"\b(chakra|energy|balance)\b", re.I), "Seven Chakra"),
     ]
     for pattern, product in _BENEFIT_TO_PRODUCT:
         if pattern.search(user_message):
             return product
+
+    # ---- TIER 4: Generic product type queries ----
+    if re.search(r"\b(mala|bracelet|necklace|pendant|band)\b", user_message, re.I):
+        return "Karungali mala"
+    if re.search(r"\b(crystal|crystals|stone|stones)\b", user_message, re.I):
+        return "Pyrite Rose Quartz Seven Chakra"
 
     context_str = ""
     if policy_context:
