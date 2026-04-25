@@ -127,26 +127,36 @@ def _init_firebase() -> bool:
         return True
 
     try:
+        opts = {"projectId": settings.firebase_project_id} if settings.firebase_project_id else None
+
+        # Priority 1: Inline JSON credentials (best for cloud deployments)
         if settings.firebase_credentials_json:
             import json
             cred_dict = json.loads(settings.firebase_credentials_json)
             cred = credentials.Certificate(cred_dict)
-            firebase_admin.initialize_app(cred, {"projectId": settings.firebase_project_id} if settings.firebase_project_id else None)
-        elif settings.firebase_credentials_path:
+            firebase_admin.initialize_app(cred, opts)
+            _firebase_init_error = None
+            return True
+
+        # Priority 2: Credentials file on disk (local development)
+        if settings.firebase_credentials_path:
             path = Path(settings.firebase_credentials_path)
             if not path.exists():
-                # Try finding it in the current directory if it's an absolute path from a different machine
-                local_path = Path(path.name)
-                if local_path.exists():
-                    path = local_path
-                else:
-                    _firebase_init_error = f"Firebase credentials file not found: {settings.firebase_credentials_path}"
-                    return False
-            
-            cred = credentials.Certificate(str(path))
-            firebase_admin.initialize_app(cred, {"projectId": settings.firebase_project_id} if settings.firebase_project_id else None)
-        else:
-            firebase_admin.initialize_app(options={"projectId": settings.firebase_project_id} if settings.firebase_project_id else None)
+                path = Path(path.name)  # try just the filename in cwd
+            if path.exists():
+                cred = credentials.Certificate(str(path))
+                firebase_admin.initialize_app(cred, opts)
+                _firebase_init_error = None
+                return True
+            # File not found — fall through to project-ID-only init
+            logger.warning(
+                "Firebase credentials file not found at %s; "
+                "falling back to project-ID-only initialization.",
+                settings.firebase_credentials_path,
+            )
+
+        # Priority 3: Project-ID-only / Application Default Credentials
+        firebase_admin.initialize_app(options=opts)
         _firebase_init_error = None
         return True
     except Exception as exc:
