@@ -33,6 +33,7 @@ const UserActivityChart = nextDynamic(() => import("./components/UserActivityCha
 type LoadState = "idle" | "loading" | "ready" | "error";
 type DashboardSection = "overview" | "conversation_explorer";
 const CHAT_LIMIT = 10;
+const API_BASE = (process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000").replace(/\/$/, "");
 
 function formatDateTime(value: string): string {
   const date = new Date(value);
@@ -172,7 +173,7 @@ export default function DashboardPage() {
   }, [router]);
 
   useEffect(() => {
-    fetch("http://localhost:8000/admin/categories")
+    fetch(`${API_BASE}/admin/categories`)
       .then(r => r.json())
       .then(data => setDynamicCategories(data))
       .catch(console.error);
@@ -753,7 +754,7 @@ export default function DashboardPage() {
                                 <button
                                   onClick={async (e) => {
                                     e.stopPropagation();
-                                    await fetch(`http://localhost:8000/admin/conversations/${chat.conversation_id}/reclassify`, { method: "POST" });
+                                    await fetch(`${API_BASE}/admin/conversations/${chat.conversation_id}/reclassify`, { method: "POST" });
                                     setOpenKebabMenuId(null);
                                     alert("Reclassification backfill started.");
                                   }}
@@ -892,7 +893,7 @@ export default function DashboardPage() {
                         onClick={async () => {
                           setIsSubmittingOverride(true);
                           try {
-                            await fetch(`http://localhost:8000/admin/conversations/${selectedChatId}/intent`, {
+                            await fetch(`${API_BASE}/admin/conversations/${selectedChatId}/intent`, {
                               method: "POST",
                               headers: { "Content-Type": "application/json", "X-Role": "admin" },
                               body: JSON.stringify({ intent_label: overrideIntentValue, category: overrideCategoryValue })

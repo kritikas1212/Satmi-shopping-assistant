@@ -2,6 +2,8 @@
 
 import React, { useState, useEffect } from "react";
 
+const API_BASE = (process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000").replace(/\/$/, "");
+
 export function CategoryManager({ onClose }: { onClose: () => void }) {
   const [categories, setCategories] = useState<string[]>([]);
   const [newCategory, setNewCategory] = useState("");
@@ -10,7 +12,7 @@ export function CategoryManager({ onClose }: { onClose: () => void }) {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    fetch("http://localhost:8000/admin/categories")
+    fetch(`${API_BASE}/admin/categories`)
       .then(r => r.json())
       .then(data => {
         setCategories(data);
@@ -27,7 +29,7 @@ export function CategoryManager({ onClose }: { onClose: () => void }) {
     setIsSaving(true);
     setError(null);
     try {
-      await fetch("http://localhost:8000/admin/categories", {
+      await fetch(`${API_BASE}/admin/categories`, {
         method: "PUT",
         headers: { "Content-Type": "application/json", "X-Role": "admin" },
         body: JSON.stringify(categories)
